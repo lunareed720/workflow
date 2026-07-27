@@ -322,46 +322,15 @@ jobs:
       fail-fast: false
       matrix:
         transport: ["http", "ws"]
+        # TEMP: pruned to express only while debugging random 500s seen
+        # there against the ws transport. Restore the full app list
+        # (example, nextjs-turbopack, nextjs-webpack, nitro, vite, nuxt,
+        # sveltekit, hono, fastify, nest, astro, tanstack-start) once
+        # resolved.
         app:
-          - name: "example"
-            project-id: "prj_xWq20Dd860HHAfzMjK2Mb6TPVxMa"
-            project-slug: "example-workflow"
-          - name: "nextjs-turbopack"
-            project-id: "prj_yjkM7UdHliv8bfxZ1sMJQf1pMpdi"
-            project-slug: "example-nextjs-workflow-turbopack"
-          - name: "nextjs-webpack"
-            project-id: "prj_avRPBF3eWjh6iDNQgmhH4VOg27h0"
-            project-slug: "example-nextjs-workflow-webpack"
-          - name: "nitro"
-            project-id: "prj_e7DZirYdLrQKXNrlxg7KmA6ABx8r"
-            project-slug: "workbench-nitro-workflow"
-          - name: "vite"
-            project-id: "prj_uLIcNZNDmETulAvj5h0IcDHi5432"
-            project-slug: "workbench-vite-workflow"
-          - name: "nuxt"
-            project-id: "prj_oTgiz3SGX2fpZuM6E0P38Ts8de6d"
-            project-slug: "workbench-nuxt-workflow"
-          - name: "sveltekit"
-            project-id: "prj_MqnBLm71ceXGSnm3Fs8i8gBnI23G"
-            project-slug: "workbench-sveltekit-workflow"
-          - name: "hono"
-            project-id: "prj_p0GIEsfl53L7IwVbosPvi9rPSOYW"
-            project-slug: "workbench-hono-workflow"
           - name: "express"
             project-id: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
             project-slug: "workbench-express-workflow"
-          - name: "fastify"
-            project-id: "prj_5Yap0VDQ633v998iqQ3L3aQ25Cck"
-            project-slug: "workbench-fastify-workflow"
-          - name: "nest"
-            project-id: "prj_AV3YrzooDhMlvfmZybqeugHRk48Y"
-            project-slug: "workbench-nestjs-workflow"
-          - name: "astro"
-            project-id: "prj_YDAXj3K8LM0hgejuIMhioz2yLgTI"
-            project-slug: "workbench-astro-workflow"
-          - name: "tanstack-start"
-            project-id: "prj_643jeVugTMq5ivsOFQHcbLG1qcnu"
-            project-slug: "workbench-tanstack-start-workflow"
     env:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
