@@ -1,4 +1,4 @@
-import { parseDurationToDate } from '@workflow/utils';
+import { parseDurationToDate, pluralize } from '@workflow/utils';
 
 import type { StringValue } from 'ms';
 
@@ -89,6 +89,7 @@ export const ERROR_SLUGS = {
   STEP_NOT_REGISTERED: 'step-not-registered',
   WORKFLOW_NOT_REGISTERED: 'workflow-not-registered',
   RUNTIME_DECRYPTION_FAILED: 'runtime-decryption-failed',
+  DEPLOYMENT_MISMATCH: 'deployment-mismatch',
 } as const;
 
 type ErrorSlug = (typeof ERROR_SLUGS)[keyof typeof ERROR_SLUGS];
@@ -587,6 +588,60 @@ export class WorkflowNotRegisteredError extends WorkflowRuntimeError {
 
   static is(value: unknown): value is WorkflowNotRegisteredError {
     return isError(value) && value.name === 'WorkflowNotRegisteredError';
+  }
+}
+
+/**
+ * Thrown when a workflow run is delivered to a deployment other than the one
+ * it is pinned to.
+ *
+ * A run is pinned to a target deployment when it starts — by default the
+ * deployment that called `start()`, or whatever `start({ deploymentId })`
+ * resolved to (including `'latest'`) — and that id is recorded on the run.
+ * Executing on any other deployment is unsafe because its workflow and step
+ * bundles may not match the run's persisted history.
+ */
+export class WorkflowDeploymentMismatchError extends WorkflowRuntimeError {
+  readonly runId: string;
+  readonly expectedDeploymentId: string;
+  readonly actualDeploymentId: string;
+  /**
+   * How many times the runtime re-routed the message at
+   * `expectedDeploymentId` before giving up. `0` means recovery was not
+   * attempted — either the budget is disabled
+   * (`WORKFLOW_DEPLOYMENT_MISMATCH_MAX_RETRIES=0`) or the re-route itself
+   * failed, in which case `cause` holds the enqueue error.
+   */
+  readonly recoveryAttempts: number;
+
+  constructor(
+    runId: string,
+    expectedDeploymentId: string,
+    actualDeploymentId: string,
+    options?: { recoveryAttempts?: number; cause?: unknown }
+  ) {
+    const recoveryAttempts = options?.recoveryAttempts ?? 0;
+    // The recovery clause is what tells a reader whether routing is racing
+    // (re-routes happened and still landed wrong) or the deployment is simply
+    // gone (no attempt succeeded) — so it belongs in the persisted message,
+    // not just in a log line.
+    const recovery =
+      recoveryAttempts > 0
+        ? ` The runtime re-routed the message to "${expectedDeploymentId}" ${recoveryAttempts} ${pluralize('time', 'times', recoveryAttempts)} and it kept arriving elsewhere, so the run was stopped to protect against code-skew errors.`
+        : ' The run was stopped to protect against code-skew errors.';
+    super(
+      `Workflow run "${runId}" is pinned to deployment "${expectedDeploymentId}", but was received by deployment "${actualDeploymentId}".${recovery} Verify that the run's deployment is still available and that queue callbacks are routed to it.`,
+      { slug: ERROR_SLUGS.DEPLOYMENT_MISMATCH, cause: options?.cause }
+    );
+    this.name = 'WorkflowDeploymentMismatchError';
+    this.runId = runId;
+    this.expectedDeploymentId = expectedDeploymentId;
+    this.actualDeploymentId = actualDeploymentId;
+    this.recoveryAttempts = recoveryAttempts;
+  }
+
+  static is(value: unknown): value is WorkflowDeploymentMismatchError {
+    return isError(value) && value.name === 'WorkflowDeploymentMismatchError';
   }
 }
 

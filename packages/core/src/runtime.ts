@@ -24,6 +24,7 @@ import {
   resolveQueueNamespace,
   SPEC_VERSION_CURRENT,
   SPEC_VERSION_SUPPORTS_COMPRESSION,
+  type WorkflowInvokePayload,
   WorkflowInvokePayloadSchema,
   type WorkflowRun,
   type World,
@@ -46,6 +47,11 @@ import {
   isTurboEnabled,
 } from './runtime/constants.js';
 import { countStepStartedEvents } from './runtime/count-step-started-events.js';
+import {
+  type DeploymentAffinityOutcome,
+  guardDeploymentAffinity,
+  type ReenqueueArgs,
+} from './runtime/deployment-guard.js';
 import {
   appendUniqueEvents,
   getQueueOverhead,
@@ -374,6 +380,7 @@ export function workflowEntrypoint(
           stepId: incomingStepId,
           stepName: incomingStepName,
           replayDivergence,
+          deploymentMismatchRetryCount,
           runInput,
         } = WorkflowInvokePayloadSchema.parse(message_);
         // `start()` always attaches a trace carrier, but
@@ -674,6 +681,19 @@ export function workflowEntrypoint(
                     }
                   };
 
+                  // A plain orchestrator-replay message for this run. Carries
+                  // none of the fields that must not survive a hand-off:
+                  //   - `runInput` re-engages turbo on the next delivery, which
+                  //     wedges the run (see `reinvoke` above).
+                  //   - `replayDivergence` / `serverErrorRetryCount` are budgets
+                  //     belonging to this delivery chain, not the next one's.
+                  const replayMessage =
+                    async (): Promise<WorkflowInvokePayload> => ({
+                      runId,
+                      traceCarrier: await nextTraceCarrier(),
+                      requestedAt: new Date(),
+                    });
+
                   const reinvoke = async (
                     delaySeconds: number
                   ): Promise<{ timeoutSeconds: number } | undefined> => {
@@ -682,14 +702,50 @@ export function workflowEntrypoint(
                     await queueMessage(
                       world,
                       getWorkflowQueueName(workflowName, namespace),
-                      {
-                        runId,
-                        traceCarrier: await nextTraceCarrier(),
-                        requestedAt: new Date(),
-                      },
+                      await replayMessage(),
                       delaySeconds > 0 ? { delaySeconds } : undefined
                     );
                     return undefined;
+                  };
+
+                  // Deployment-affinity guard, shared by the two paths that
+                  // execute a run: queued step executions and flow replays.
+                  // `run` must be one the caller already loaded, so the guard
+                  // adds no round trip.
+                  const guardDeployment = async (
+                    run: Pick<
+                      WorkflowRun,
+                      'runId' | 'deploymentId' | 'specVersion'
+                    >,
+                    reenqueuePayload: () => Promise<WorkflowInvokePayload>,
+                    beforeStop?: () => Promise<void>
+                  ): Promise<DeploymentAffinityOutcome> => {
+                    const { outcome, spanAttributes } =
+                      await guardDeploymentAffinity({
+                        world,
+                        run,
+                        requestId,
+                        retryCount: deploymentMismatchRetryCount,
+                        beforeStop,
+                        reenqueue: async ({
+                          deploymentId,
+                          specVersion,
+                          deploymentMismatchRetryCount: retryCount,
+                          delaySeconds,
+                        }: ReenqueueArgs) => {
+                          await queueMessage(
+                            world,
+                            getWorkflowQueueName(workflowName, namespace),
+                            {
+                              ...(await reenqueuePayload()),
+                              deploymentMismatchRetryCount: retryCount,
+                            },
+                            { deploymentId, specVersion, delaySeconds }
+                          );
+                        },
+                      });
+                    if (spanAttributes) span?.setAttributes(spanAttributes);
+                    return outcome;
                   };
 
                   // If incoming message has a stepId, this is a background step
@@ -707,6 +763,20 @@ export function workflowEntrypoint(
                           'Run already finished, skipping background step',
                           { workflowRunId: runId, status: bgRun.status }
                         );
+                        return;
+                      }
+                      // Covers every queued step execution — first dispatch and
+                      // redeliveries/retries alike. `bgRun` is already loaded
+                      // for the status check above, so this adds no round trip.
+                      // The re-routed message keeps `stepId`/`stepName` so the
+                      // pending step still runs, just on the right deployment.
+                      if (
+                        (await guardDeployment(bgRun, async () => ({
+                          ...(await replayMessage()),
+                          stepId: incomingStepId,
+                          stepName: incomingStepName,
+                        }))) !== 'continue'
+                      ) {
                         return;
                       }
                       const bgStartedAt = bgRun.startedAt
@@ -1167,6 +1237,25 @@ export function workflowEntrypoint(
                       }
                     } // end else (non-turbo run_started)
                   } // end if (!workflowRun)
+
+                  // Covers every flow replay — initial start, step completions,
+                  // hook resumptions, wait completions — and stops before any
+                  // workflow code or inline step runs if this delivery reached a
+                  // deployment the run is not pinned to. Continuing risks code
+                  // skew, and any step it dispatches would resolve the wrong
+                  // encryption key. `workflowRun` is already in hand here, so
+                  // the check adds no round trip. `awaitRunReady` ensures a
+                  // turbo-backgrounded run_started has landed before we record
+                  // a failure.
+                  if (
+                    (await guardDeployment(
+                      workflowRun,
+                      replayMessage,
+                      awaitRunReady
+                    )) !== 'continue'
+                  ) {
+                    return;
+                  }
 
                   // Resolve the encryption key for this run's deployment.
                   // Used eagerly here since both runWorkflow (input

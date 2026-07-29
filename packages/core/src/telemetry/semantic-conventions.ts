@@ -316,6 +316,35 @@ export const QueueOverheadMs = SemanticConvention<number>(
 /** Unique identifier for the deployment environment */
 export const DeploymentId = SemanticConvention<string>('deployment.id');
 
+/**
+ * The deployment a run is pinned to — set only on an invocation that received
+ * a run belonging to some OTHER deployment, so its presence marks a misrouted
+ * delivery. Compare against `deployment.id` (the receiving deployment) to see
+ * which pair drifted.
+ */
+export const WorkflowRunPinnedDeploymentId = SemanticConvention<string>(
+  'workflow.deployment.pinned_id'
+);
+
+/**
+ * Re-route attempts already made for this misrouted delivery chain, including
+ * the one this invocation is making. Bounded by
+ * `WORKFLOW_DEPLOYMENT_MISMATCH_MAX_RETRIES`.
+ */
+export const WorkflowDeploymentMismatchRetryCount = SemanticConvention<number>(
+  'workflow.deployment_mismatch.retry_count'
+);
+
+/**
+ * Whether a misrouted delivery was re-routed at the run's own deployment
+ * (`true`) or gave up and failed the run with `DEPLOYMENT_MISMATCH` (`false`).
+ * Rate of `false` over `true` is the signal that routing is genuinely broken
+ * rather than racing.
+ */
+export const WorkflowDeploymentMismatchRecovered = SemanticConvention<boolean>(
+  'workflow.deployment_mismatch.recovered'
+);
+
 // Hook attributes
 
 /** Token identifying a specific hook */

@@ -12,12 +12,16 @@ import {
 import { ulid } from 'ulid';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerStepFunction } from './private.js';
-import { REPLAY_DIVERGENCE_MAX_RETRIES } from './runtime/constants.js';
+import {
+  DEPLOYMENT_MISMATCH_MAX_RETRIES,
+  REPLAY_DIVERGENCE_MAX_RETRIES,
+} from './runtime/constants.js';
 import { setWorld } from './runtime/world.js';
 import { workflowEntrypoint } from './runtime.js';
 import {
   dehydrateStepReturnValue,
   dehydrateWorkflowArguments,
+  hydrateRunError,
 } from './serialization.js';
 
 // Capture every promise handed to `waitUntil` so tests can assert that
@@ -46,6 +50,13 @@ async function anyWaitUntilPromiseRejected(): Promise<boolean> {
   return results.some((r) => r.status === 'rejected');
 }
 
+/** One recorded `world.queue` call from the harness's queue mock. */
+type QueueCall = {
+  queueName: string;
+  message: any;
+  opts?: Record<string, unknown>;
+};
+
 async function runWorkflowHandlerWithEvents(
   workflowCode: string,
   workflowRun: WorkflowRun,
@@ -53,7 +64,7 @@ async function runWorkflowHandlerWithEvents(
   options: {
     attempt?: number;
     createdEvents?: unknown[];
-    queuedMessages?: unknown[];
+    queueCalls?: QueueCall[];
     replayDivergence?: { eventId: string; count: number };
     /**
      * Make created events visible to subsequent events.list calls (appended
@@ -63,6 +74,12 @@ async function runWorkflowHandlerWithEvents(
      * pin the log's contents keep full control.
      */
     dynamicEventLog?: boolean;
+    currentDeploymentId?: string;
+    /** `deploymentMismatchRetryCount` on the incoming queue message. */
+    deploymentMismatchRetryCount?: number;
+    /** Set both to drive the background-step branch of the combined handler. */
+    incomingStepId?: string;
+    incomingStepName?: string;
   } = {}
 ) {
   const createdEvents = options.createdEvents ?? [];
@@ -90,6 +107,12 @@ async function runWorkflowHandlerWithEvents(
 
   setWorld({
     specVersion: SPEC_VERSION_CURRENT,
+    // Declares atomic, immutable deployments (as world-vercel does); worlds
+    // that leave it unset (local/postgres) skip the deployment guard.
+    capabilities: { deploymentAffinity: true },
+    getDeploymentId: vi.fn(
+      async () => options.currentDeploymentId ?? workflowRun.deploymentId
+    ),
     createQueueHandler: vi.fn(
       (
         _prefix: string,
@@ -101,6 +124,10 @@ async function runWorkflowHandlerWithEvents(
               runId: workflowRun.runId,
               requestedAt: new Date('2024-01-01T00:00:00.000Z'),
               replayDivergence: options.replayDivergence,
+              deploymentMismatchRetryCount:
+                options.deploymentMismatchRetryCount,
+              stepId: options.incomingStepId,
+              stepName: options.incomingStepName,
             },
             {
               requestId: 'req_test',
@@ -124,10 +151,16 @@ async function runWorkflowHandlerWithEvents(
     runs: {
       get: vi.fn(async () => workflowRun),
     },
-    queue: vi.fn(async (_queueName: string, message: unknown) => {
-      options.queuedMessages?.push(message);
-      return { messageId: null };
-    }),
+    queue: vi.fn(
+      async (
+        queueName: string,
+        message: unknown,
+        opts?: Record<string, unknown>
+      ) => {
+        options.queueCalls?.push({ queueName, message, opts });
+        return { messageId: null };
+      }
+    ),
     getEncryptionKeyForRun: vi.fn(async () => undefined),
   } as any);
 
@@ -146,6 +179,135 @@ describe('workflowEntrypoint replay guards', () => {
   const getWorkflowTransformCode = (workflowName: string) =>
     `;globalThis.__private_workflows = new Map();
     globalThis.__private_workflows.set(${JSON.stringify(workflowName)}, ${workflowName});`;
+
+  /** A run pinned to `dpl_origin`, for the deployment-affinity tests below. */
+  const misroutedRun = async (): Promise<WorkflowRun> => ({
+    runId: 'wrun_wrong_deployment',
+    workflowName: 'workflow',
+    status: 'running',
+    input: await dehydrateWorkflowArguments(
+      [],
+      'wrun_wrong_deployment',
+      undefined,
+      []
+    ),
+    createdAt: new Date('2024-01-01T00:00:00.000Z'),
+    updatedAt: new Date('2024-01-01T00:00:00.000Z'),
+    startedAt: new Date('2024-01-01T00:00:00.000Z'),
+    deploymentId: 'dpl_origin',
+    specVersion: SPEC_VERSION_CURRENT,
+  });
+
+  const mustNotRun = `async function workflow() {
+        throw new Error('workflow code must not execute');
+      }${getWorkflowTransformCode('workflow')}`;
+
+  it('re-routes a flow replay delivered to a different deployment', async () => {
+    // Misrouting can be a transient routing race, so the first response is to
+    // re-enqueue the message explicitly targeted at the run's own deployment —
+    // not to fail the run. No workflow code runs here either way.
+    const workflowRun = await misroutedRun();
+    const queueCalls: QueueCall[] = [];
+
+    const createdEvents = await runWorkflowHandlerWithEvents(
+      mustNotRun,
+      workflowRun,
+      [],
+      { currentDeploymentId: 'dpl_current', queueCalls }
+    );
+
+    expect(queueCalls).toHaveLength(1);
+    expect(queueCalls[0].opts).toMatchObject({
+      deploymentId: 'dpl_origin',
+      specVersion: SPEC_VERSION_CURRENT,
+      delaySeconds: 1,
+    });
+    expect(queueCalls[0].message).toMatchObject({
+      runId: 'wrun_wrong_deployment',
+      deploymentMismatchRetryCount: 1,
+    });
+    // `runInput` must not ride along — it would re-engage turbo on the next
+    // delivery and wedge the run.
+    expect(queueCalls[0].message).not.toHaveProperty('runInput');
+    // Recovery is not a failure.
+    expect(createdEvents).not.toContainEqual(
+      expect.objectContaining({ eventType: 'run_failed' })
+    );
+  });
+
+  it('re-routes a queued step execution, preserving the pending step', async () => {
+    const workflowRun = await misroutedRun();
+    const queueCalls: QueueCall[] = [];
+
+    const createdEvents = await runWorkflowHandlerWithEvents(
+      mustNotRun,
+      workflowRun,
+      [],
+      {
+        currentDeploymentId: 'dpl_current',
+        incomingStepId: 'step_1',
+        incomingStepName: 'myStep',
+        queueCalls,
+      }
+    );
+
+    expect(queueCalls).toHaveLength(1);
+    expect(queueCalls[0].opts).toMatchObject({ deploymentId: 'dpl_origin' });
+    // The step identity survives, so the pending step still runs — on the
+    // deployment that can actually decrypt its input.
+    expect(queueCalls[0].message).toMatchObject({
+      runId: 'wrun_wrong_deployment',
+      stepId: 'step_1',
+      stepName: 'myStep',
+      deploymentMismatchRetryCount: 1,
+    });
+    expect(createdEvents).not.toContainEqual(
+      expect.objectContaining({ eventType: 'step_started' })
+    );
+    expect(createdEvents).not.toContainEqual(
+      expect.objectContaining({ eventType: 'run_failed' })
+    );
+  });
+
+  it('fails a misrouted run once the re-route budget is spent', async () => {
+    // With the budget spent the run is failed before any workflow code or step
+    // runs, and the failure is recorded with the DEPLOYMENT_MISMATCH code
+    // without resolving the (possibly-gone) pinned deployment's encryption key.
+    const workflowRun = await misroutedRun();
+    const queueCalls: QueueCall[] = [];
+
+    const createdEvents = await runWorkflowHandlerWithEvents(
+      mustNotRun,
+      workflowRun,
+      [],
+      {
+        currentDeploymentId: 'dpl_current',
+        deploymentMismatchRetryCount: DEPLOYMENT_MISMATCH_MAX_RETRIES,
+        queueCalls,
+      }
+    );
+
+    expect(queueCalls).toHaveLength(0);
+    const failedEvent = createdEvents.find(
+      (event: any) => event.eventType === 'run_failed'
+    ) as any;
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent.eventData.errorCode).toBe(
+      RUN_ERROR_CODES.DEPLOYMENT_MISMATCH
+    );
+    const error = await hydrateRunError(
+      failedEvent.eventData.error,
+      workflowRun.runId,
+      undefined
+    );
+    // The message wording (including the attempt count) is pinned by
+    // deployment-guard.test.ts; here we only prove the error survives the
+    // event round trip with its identity intact.
+    expect(error).toMatchObject({ name: 'WorkflowDeploymentMismatchError' });
+    expect(createdEvents).not.toContainEqual(
+      expect.objectContaining({ eventType: 'run_completed' })
+    );
+  });
 
   it('records run_failed when run_started response schema validation fails', async () => {
     const createdEvents: unknown[] = [];
@@ -174,6 +336,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => 'test-deployment'),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -272,6 +435,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => 'test-deployment'),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -369,6 +533,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -448,6 +613,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -587,7 +753,7 @@ describe('workflowEntrypoint replay guards', () => {
     ];
 
     const initialAttemptEvents: unknown[] = [];
-    const queuedMessages: unknown[] = [];
+    const queueCalls: QueueCall[] = [];
     await runWorkflowHandlerWithEvents(
       `const sleep = globalThis[Symbol.for("WORKFLOW_SLEEP")];
       async function workflow() {
@@ -598,14 +764,14 @@ describe('workflowEntrypoint replay guards', () => {
       events,
       {
         createdEvents: initialAttemptEvents,
-        queuedMessages,
+        queueCalls,
       }
     );
 
     expect(initialAttemptEvents).not.toContainEqual(
       expect.objectContaining({ eventType: 'run_failed' })
     );
-    expect(queuedMessages).toContainEqual(
+    expect(queueCalls.map((c) => c.message)).toContainEqual(
       expect.objectContaining({
         replayDivergence: {
           eventId: 'event-0',
@@ -678,7 +844,7 @@ describe('workflowEntrypoint replay guards', () => {
     ];
 
     const createdEvents: unknown[] = [];
-    const queuedMessages: unknown[] = [];
+    const queueCalls: QueueCall[] = [];
     await runWorkflowHandlerWithEvents(
       `const createHook = globalThis[Symbol.for("WORKFLOW_CREATE_HOOK")];
       async function workflow() {
@@ -688,13 +854,13 @@ describe('workflowEntrypoint replay guards', () => {
       }${getWorkflowTransformCode('workflow')}`,
       workflowRun,
       events,
-      { createdEvents, queuedMessages }
+      { createdEvents, queueCalls }
     );
 
     expect(createdEvents).not.toContainEqual(
       expect.objectContaining({ eventType: 'run_failed' })
     );
-    expect(queuedMessages).toContainEqual(
+    expect(queueCalls.map((c) => c.message)).toContainEqual(
       expect.objectContaining({
         replayDivergence: { eventId: 'event-0', count: 1 },
       })
@@ -731,10 +897,10 @@ describe('workflowEntrypoint replay guards', () => {
       }${getWorkflowTransformCode('workflow')}`;
 
     const createdEvents: any[] = [];
-    const queuedMessages: unknown[] = [];
+    const queueCalls: QueueCall[] = [];
     await runWorkflowHandlerWithEvents(workflowCode, workflowRun, [], {
       createdEvents,
-      queuedMessages,
+      queueCalls,
       dynamicEventLog: true,
     });
 
@@ -748,7 +914,7 @@ describe('workflowEntrypoint replay guards', () => {
     expect(createdEvents).toContainEqual(
       expect.objectContaining({ eventType: 'run_completed' })
     );
-    expect(queuedMessages).toEqual([]);
+    expect(queueCalls).toEqual([]);
     // Under lazy inline start the step that loses the attribute race is NOT
     // eagerly created: its step_created is deferred for a lazy step_started
     // that never fires, because the attribute-resolving replay decides the
@@ -809,6 +975,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -918,6 +1085,7 @@ describe('workflowEntrypoint replay guards', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -1139,6 +1307,7 @@ describe('workflowEntrypoint step-dispatch ack ordering', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (
           _prefix: string,
@@ -1384,6 +1553,7 @@ describe('workflowEntrypoint step-dispatch ack ordering', () => {
     });
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => workflowRun.deploymentId),
       createQueueHandler: vi.fn(
         (_p: string, handler: (m: unknown, md: unknown) => Promise<unknown>) =>
           async () => {
@@ -1559,6 +1729,7 @@ describe('workflowEntrypoint turbo mode', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => 'test-deployment'),
       createQueueHandler: vi.fn(
         (_p: string, handler: (m: unknown, md: unknown) => Promise<unknown>) =>
           async () => {
@@ -2177,6 +2348,7 @@ describe('workflowEntrypoint latency telemetry (ttfs / stso)', () => {
 
     setWorld({
       specVersion: SPEC_VERSION_CURRENT,
+      getDeploymentId: vi.fn(async () => 'test-deployment'),
       createQueueHandler: vi.fn(
         (_p: string, handler: (m: unknown, md: unknown) => Promise<unknown>) =>
           async () => {

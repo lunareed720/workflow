@@ -42,6 +42,10 @@ export function createWorld(config?: APIConfig): World {
       // WORKFLOW_SEQUENTIAL_REPLAYS=1 uses for per-run `maxConcurrency: 1`
       // flow topics (see queue.ts and @workflow/builders).
       maxConcurrency: true,
+      // Vercel deployments are atomic and immutable, so a run's deploymentId
+      // names one fixed build and the runtime can enforce that the run only
+      // ever executes there.
+      deploymentAffinity: true,
     },
     // On Vercel the platform fails the function invocation when the
     // process exits non-zero, and VQS redelivers the queue message via a

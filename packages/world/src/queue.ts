@@ -127,6 +127,13 @@ export const WorkflowInvokePayloadSchema = z.object({
     .optional(),
   /** Number of times this message has been re-enqueued due to server errors (5xx) */
   serverErrorRetryCount: z.number().int().optional(),
+  /**
+   * Number of times this message has been re-routed after being delivered to a
+   * deployment other than the one its run is pinned to. Bounded by
+   * `WORKFLOW_DEPLOYMENT_MISMATCH_MAX_RETRIES`, after which the run is failed
+   * with the `DEPLOYMENT_MISMATCH` error code.
+   */
+  deploymentMismatchRetryCount: z.number().int().nonnegative().optional(),
   /** Step ID for inline step execution in combined handler. If provided, the flow execution
    * will jump directly to execute the step with the given ID before doing an event replay. */
   stepId: z.string().optional(),
