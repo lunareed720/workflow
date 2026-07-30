@@ -572,15 +572,12 @@ jobs:
       matrix:
         app:
           - name: "example"
-            dir: "workbench/example"
             project-id: "prj_xWq20Dd860HHAfzMjK2Mb6TPVxMa"
             project-slug: "example-workflow"
           - name: "nextjs-turbopack"
-            dir: "workbench/nextjs-turbopack"
             project-id: "prj_yjkM7UdHliv8bfxZ1sMJQf1pMpdi"
             project-slug: "example-nextjs-workflow-turbopack"
           - name: "express"
-            dir: "workbench/express"
             project-id: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
             project-slug: "workbench-express-workflow"
     env:
@@ -614,24 +611,26 @@ jobs:
           WS_VERCEL_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
         run: |
           set -euo pipefail
-          # `vercel deploy --project=X --cwd=Y` with no prior link doubles
-          # the path (tries to resolve X's rootDirectory *underneath* Y,
-          # even though Y already *is* that directory) — link first with
-          # `vercel pull` in the same --cwd (fetches project settings only,
-          # no build/deploy), then the deploy call below needs no --project
-          # at all and doesn't double the path.
+          # `vercel deploy` (source-upload mode, no --prebuilt) re-applies
+          # the linked project's own Root Directory setting internally —
+          # unlike `vercel build`, it expects to run from the repo root and
+          # narrow down itself, the same way the GitHub App's own deploy
+          # does. Passing `--cwd=<app dir>` here double-joins that Root
+          # Directory underneath itself ("workbench/x/workbench/x does not
+          # exist"). Link and deploy from the repo root — no --cwd at all —
+          # and let the project's own Root Directory setting do the
+          # narrowing, matching how every passively-triggered deployment in
+          # this file already works.
           vercel pull --yes --environment=preview \
             --project="${{ matrix.app.project-id }}" \
-            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" \
-            --cwd="${{ matrix.app.dir }}"
+            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN"
           # `vercel deploy` writes the new deployment's URL to stdout and
           # progress/logs to stderr, specifically so it composes as
           # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
           # into this capture.
           URL=$(vercel deploy --yes \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
-            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" \
-            --cwd="${{ matrix.app.dir }}")
+            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           # Best-effort: only used by the runtime-logs capture on failure,
           # which already skips gracefully if this doesn't parse.
