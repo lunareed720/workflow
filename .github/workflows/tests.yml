@@ -591,6 +591,17 @@ jobs:
         with:
           build-packages: 'true'
 
+      # Installed once, pinned, and invoked as a plain binary below —
+      # deliberately not `npx vercel@56.2.0` per command. Each `npx` call
+      # re-resolves/re-fetches the package independently, and across
+      # repeated CI attempts that showed genuinely inconsistent behavior for
+      # the exact same commands (a `Vercel CLI ... (Node.js 22.23.1)` banner
+      # once, `Node.js 24.x` every other time; a project-root path doubled
+      # on one `vercel pull` call and not others) — install is one
+      # resolution for the whole job instead of three per invocation.
+      - name: Install vercel CLI
+        run: npm install -g vercel@56.2.0
+
       - name: Deploy a dedicated WS-transport preview
         id: wsDeploy
         env:
@@ -606,22 +617,22 @@ jobs:
           NITRO_PRESET: vercel
         run: |
           set -euo pipefail
-          npx vercel@56.2.0 pull --yes --environment=preview \
+          vercel pull --yes --environment=preview \
             --project="$WS_PROJECT_ID" --scope="$WS_TEAM_ID" \
             --token="$WS_VERCEL_TOKEN" --cwd=workbench/express
-          npx vercel@56.2.0 build \
+          vercel build \
             --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" --cwd=workbench/express
           # `vercel deploy` writes the new deployment's URL to stdout and
           # progress/logs to stderr, specifically so it composes as
           # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
           # into this capture.
-          URL=$(npx vercel@56.2.0 deploy --prebuilt --yes \
+          URL=$(vercel deploy --prebuilt --yes \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
             --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" --cwd=workbench/express)
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           # Best-effort: only used by the runtime-logs capture on failure,
           # which already skips gracefully if this doesn't parse.
-          DEPLOYMENT_ID=$(npx vercel@56.2.0 inspect "$URL" --format=json \
+          DEPLOYMENT_ID=$(vercel inspect "$URL" --format=json \
             --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" 2>/dev/null \
             | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).id||'')}catch{}})" || true)
           echo "deploymentId=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
