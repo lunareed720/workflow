@@ -1141,7 +1141,7 @@ describe('devalue codec', () => {
 
   it('should support deserializeLegacy', async () => {
     // Simulate legacy data (devalue unflatten format)
-    const { stringify } = await import('../vendor/devalue/index.js');
+    const { stringify } = await import('devalue');
     const value = { test: 'legacy' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test
@@ -1306,7 +1306,7 @@ describe('workflow.serialize / workflow.deserialize', () => {
 
   it('should deserialize legacy non-binary data', async () => {
     // Simulate legacy format (devalue unflatten array)
-    const { stringify } = await import('../vendor/devalue/index.js');
+    const { stringify } = await import('devalue');
     const value = { hello: 'world' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test
@@ -1395,7 +1395,7 @@ describe('step.serialize / step.deserialize', () => {
   });
 
   it('should deserialize legacy non-binary data', async () => {
-    const { stringify } = await import('../vendor/devalue/index.js');
+    const { stringify } = await import('devalue');
     const value = { hello: 'step' };
     const str = stringify(value);
     // biome-ignore lint/security/noGlobalEval: test

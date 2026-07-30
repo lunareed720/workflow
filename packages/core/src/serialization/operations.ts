@@ -39,9 +39,9 @@ import { types } from 'node:util';
 import { runInNewContext } from 'node:vm';
 import {
   DevalueError,
-  defaultOperations,
+  defaultStringifyOperations,
   stringify,
-} from '../vendor/devalue/index.js';
+} from 'devalue';
 
 // ---------------------------------------------------------------------------
 // Passivity taint context
@@ -97,9 +97,9 @@ export function taintSerialization(reason: string): void {
 // implemented in JavaScript inside Node (so they don't even stringify as
 // native code); there is no patch-proof source for them, and they are
 // captured from the host realm at module load. The residual trust — shared
-// with `util.types` brand checks, the statics the vendored devalue
-// dispatches internally, and an `Error.prepareStackTrace` installed before
-// this module loaded — is that code loaded before @workflow/core has not
+// with `util.types` brand checks, the statics devalue dispatches
+// internally, and an `Error.prepareStackTrace` installed before this
+// module loaded — is that code loaded before @workflow/core has not
 // patched them.
 
 /**
@@ -589,9 +589,10 @@ function hardenedTag(value: object): string {
 /**
  * The `operations` override passed to every `stringify` call. Only the
  * operations that could execute value-owned code (or dispatch through a
- * patchable prototype) are replaced; structural ones (`arrayIndices`,
- * `hasOwnIndex`, …) already use passive engine-level primitives in devalue
- * itself. (`objectShape` is wrapped only to taint Proxy prototypes.)
+ * patchable prototype) are replaced; structural ones (`identify`,
+ * `toPrimitive`, `hasOwn`, `indicesOf`, …) are already passive for
+ * non-Proxy values, and Proxies taint at `typeOf` before any of them run.
+ * (`shapeOf` is wrapped only to taint Proxy prototypes.)
  */
 const hardenedOperations = {
   typeOf(value: unknown): string {
@@ -606,7 +607,7 @@ const hardenedOperations = {
     return type;
   },
 
-  tag: hardenedTag,
+  tagOf: hardenedTag,
 
   isThenable(value: object): boolean {
     return typeof passiveGet(value, 'then') === 'function';
@@ -632,14 +633,14 @@ const hardenedOperations = {
   // value where stock devalue serialized it dynamically, so each operation
   // brand-checks first and otherwise taints + preserves the stock behavior.
 
-  dateISO(value: Date): string {
+  toISOString(value: Date): string {
     if (types.isDate(value)) {
       return numberIsNaN(dateGetDate.call(value))
         ? ''
         : dateToISOString.call(value);
     }
     taintSerialization('Date tag without Date brand');
-    return defaultOperations.dateISO(value);
+    return defaultStringifyOperations.toISOString(value);
   },
 
   toStringValue(value: object): string {
@@ -651,7 +652,7 @@ const hardenedOperations = {
     return (value as { toString(): string }).toString();
   },
 
-  regExp(value: RegExp): { source: string; flags: string } {
+  regExpInfo(value: RegExp): { source: string; flags: string } {
     if (types.isRegExp(value)) {
       return {
         source: regExpSource.call(value) as string,
@@ -659,10 +660,10 @@ const hardenedOperations = {
       };
     }
     taintSerialization('RegExp tag without RegExp brand');
-    return defaultOperations.regExp(value);
+    return defaultStringifyOperations.regExpInfo(value);
   },
 
-  setValues(value: Set<unknown>): Iterable<unknown> {
+  valuesOf(value: Set<unknown>): Iterable<unknown> {
     if (types.isSet(value)) return intrinsicSetValues(value);
     // A Proxy over a Set would serialize into devalue's native inline Set
     // encoding, which the custom 'Set' reviver then mangles on parse. The
@@ -678,12 +679,12 @@ const hardenedOperations = {
     }
     taintSerialization('Set tag without Set brand');
     // Stock behavior: stringify iterates the value itself.
-    return defaultOperations.setValues(value);
+    return defaultStringifyOperations.valuesOf(value);
   },
 
-  mapEntries(value: Map<unknown, unknown>): Iterable<[unknown, unknown]> {
+  entriesOf(value: Map<unknown, unknown>): Iterable<[unknown, unknown]> {
     if (types.isMap(value)) return intrinsicMapEntries(value);
-    // See setValues: a proxied Map must fail loudly, not misparse.
+    // See valuesOf: a proxied Map must fail loudly, not misparse.
     if (types.isProxy(value)) {
       throw new DevalueError(
         'Cannot serialize a proxied Map',
@@ -693,28 +694,28 @@ const hardenedOperations = {
       );
     }
     taintSerialization('Map tag without Map brand');
-    return defaultOperations.mapEntries(value);
+    return defaultStringifyOperations.entriesOf(value);
   },
 
-  arrayLength(value: unknown[]): number {
+  lengthOf(value: unknown[]): number {
     if (!arrayIsArray(value)) {
       // Tag-spoofed 'Array': the serializer loop coerces this length (which
       // can run an object-valued length's valueOf/Symbol.toPrimitive), so
       // taint and preserve the stock read.
       taintSerialization('Array tag without Array brand');
-      return defaultOperations.arrayLength(value);
+      return defaultStringifyOperations.lengthOf(value);
     }
     // On a genuine array `length` is an own (non-configurable) data property.
     return passiveGet(value, 'length') as number;
   },
 
-  arrayBuffer(value: ArrayBuffer): ArrayBuffer {
+  toArrayBuffer(value: ArrayBuffer): ArrayBuffer {
     if (!types.isArrayBuffer(value) && !types.isSharedArrayBuffer(value)) {
       // Tag-spoofed 'ArrayBuffer': base64 encoding coerces it through
       // Uint8Array/Buffer, which can execute value-owned code.
       taintSerialization('ArrayBuffer tag without ArrayBuffer brand');
     }
-    return defaultOperations.arrayBuffer(value);
+    return defaultStringifyOperations.toArrayBuffer(value);
   },
 
   viewInfo(value: ArrayBufferView): {
@@ -727,7 +728,7 @@ const hardenedOperations = {
     const isDataView = types.isDataView(value);
     if (!isDataView && !types.isTypedArray(value)) {
       taintSerialization('view tag without view brand');
-      return defaultOperations.viewInfo(value);
+      return defaultStringifyOperations.viewInfo(value);
     }
     const buffer = (
       isDataView ? dataViewBuffer.call(value) : typedArrayBuffer.call(value)
@@ -753,7 +754,7 @@ const hardenedOperations = {
     };
   },
 
-  objectShape(value: object) {
+  shapeOf(value: object) {
     // The default implementation reads the value's prototype (and the
     // prototype's own property names) to detect plain objects. Both run
     // traps when the *prototype* is a Proxy — the value itself already
@@ -767,7 +768,7 @@ const hardenedOperations = {
         taintSerialization('proxy in prototype chain');
       }
     }
-    return defaultOperations.objectShape(value);
+    return defaultStringifyOperations.shapeOf(value);
   },
 
   get(value: object, key: string | number): unknown {

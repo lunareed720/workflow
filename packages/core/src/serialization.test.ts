@@ -5110,7 +5110,7 @@ describe('getDeserializeStream legacy fallback', () => {
   }
 
   it('should parse legacy newline-delimited devalue text', async () => {
-    const { stringify } = await import('./vendor/devalue/index.js');
+    const { stringify } = await import('devalue');
     const encoder = new TextEncoder();
 
     const line1 = `${stringify({ hello: 'world' })}\n`;
@@ -5124,7 +5124,7 @@ describe('getDeserializeStream legacy fallback', () => {
   });
 
   it('should parse legacy single-line chunks', async () => {
-    const { stringify } = await import('./vendor/devalue/index.js');
+    const { stringify } = await import('devalue');
     const encoder = new TextEncoder();
 
     const chunk1 = encoder.encode(`${stringify('hello')}\n`);

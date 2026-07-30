@@ -10,7 +10,7 @@
  * typed arrays, Map, Set natively).
  */
 
-import { parse, unflatten } from '../vendor/devalue/index.js';
+import { parse, unflatten } from 'devalue';
 import type { Codec, CodecOptions, SerializationMode } from './codec.js';
 import { hardenedStringify, withPassivityReport } from './operations.js';
 import { getClassReducers, getClassRevivers } from './reducers/class.js';

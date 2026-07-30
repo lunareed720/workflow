@@ -1,7 +1,7 @@
 import { createContext, runInContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { dehydrateStepArguments } from '../serialization.js';
-import { stringify } from '../vendor/devalue/index.js';
+import { stringify } from 'devalue';
 import {
   hardenedStringify,
   registerRealmSerializationIntrinsics,

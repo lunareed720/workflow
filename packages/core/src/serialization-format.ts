@@ -7,7 +7,7 @@
  */
 
 import { getEventDataRefFields } from '@workflow/world';
-import { parse, unflatten } from './vendor/devalue/index.js';
+import { parse, unflatten } from 'devalue';
 
 // ---------------------------------------------------------------------------
 // Key material (browser-safe re-exports)

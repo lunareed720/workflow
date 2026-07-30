@@ -108,7 +108,7 @@ import {
 import * as Attr from './telemetry/semantic-conventions.js';
 import { getActiveSpan, getSpanKind, recordElapsedSpan } from './telemetry.js';
 import { getAbortStreamId } from './util.js';
-import { parse, unflatten } from './vendor/devalue/index.js';
+import { parse, unflatten } from 'devalue';
 import { WorkflowAbortSignal } from './workflow/abort-controller.js';
 
 // Re-export types and utilities from the modular serialization modules

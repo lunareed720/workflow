@@ -124,6 +124,10 @@ export function buildByteCorpus(): Array<{ name: string; value: unknown }> {
       name: 'data view',
       value: new DataView(new Uint8Array([9, 8, 7]).buffer),
     },
+    // Snapshot deliberately regenerated for devalue's #166 fix: 5.8.1
+    // emitted the subview length slot as literal `undefined` — invalid JSON
+    // that parse() could never read back — so no readable stored payload
+    // can contain the old form.
     { name: 'data view subview', value: new DataView(buffer, 1, 4) },
     { name: 'node buffer', value: Buffer.from([104, 105]) },
     // ---- boxed primitives (devalue-internal handling) ----

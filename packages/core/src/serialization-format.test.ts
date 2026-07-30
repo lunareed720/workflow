@@ -1,4 +1,4 @@
-import { stringify } from './vendor/devalue/index.js';
+import { stringify } from 'devalue';
 import { describe, expect, it } from 'vitest';
 import {
   ClassInstanceRef,

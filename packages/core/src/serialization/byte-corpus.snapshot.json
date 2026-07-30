@@ -31,7 +31,7 @@
   "bigint64 array": "[[\"BigInt64Array\",1],\"AQAAAAAAAAD+/////////w==\"]",
   "uint8 clamped array": "[[\"Uint8ClampedArray\",1],\"AP8=\"]",
   "data view": "[[\"DataView\",1],[\"ArrayBuffer\",2],\"CQgH\"]",
-  "data view subview": "[[\"DataView\",1,1,undefined],[\"ArrayBuffer\",2],\"AQIDBAUGBwg=\"]",
+  "data view subview": "[[\"DataView\",1,1,4],[\"ArrayBuffer\",2],\"AQIDBAUGBwg=\"]",
   "node buffer": "[[\"Uint8Array\",1],\"aGk=\"]",
   "boxed number": "[[\"Object\",1],42]",
   "boxed string": "[[\"Object\",1],\"boxed\"]",

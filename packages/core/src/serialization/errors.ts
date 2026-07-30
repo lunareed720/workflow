@@ -12,7 +12,7 @@
 
 import { RuntimeDecryptionError } from '@workflow/errors';
 import { runtimeLogger } from '../logger.js';
-import { DevalueError } from '../vendor/devalue/index.js';
+import { DevalueError } from 'devalue';
 
 /**
  * Rethrow SDK runtime errors that must not be reframed as
