@@ -620,6 +620,7 @@ jobs:
           # into this capture.
           URL=$(vercel deploy --yes \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
+            --project="${{ matrix.app.project-id }}" \
             --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" \
             --cwd="${{ matrix.app.dir }}")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
