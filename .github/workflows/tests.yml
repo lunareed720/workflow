@@ -614,13 +614,22 @@ jobs:
           WS_VERCEL_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
         run: |
           set -euo pipefail
+          # `vercel deploy --project=X --cwd=Y` with no prior link doubles
+          # the path (tries to resolve X's rootDirectory *underneath* Y,
+          # even though Y already *is* that directory) — link first with
+          # `vercel pull` in the same --cwd (fetches project settings only,
+          # no build/deploy), then the deploy call below needs no --project
+          # at all and doesn't double the path.
+          vercel pull --yes --environment=preview \
+            --project="${{ matrix.app.project-id }}" \
+            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" \
+            --cwd="${{ matrix.app.dir }}"
           # `vercel deploy` writes the new deployment's URL to stdout and
           # progress/logs to stderr, specifically so it composes as
           # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
           # into this capture.
           URL=$(vercel deploy --yes \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
-            --project="${{ matrix.app.project-id }}" \
             --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" \
             --cwd="${{ matrix.app.dir }}")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
