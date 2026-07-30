@@ -563,8 +563,14 @@ jobs:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
       WORKFLOW_PUBLIC_MANIFEST: '1'
-      VERCEL_PROJECT_ID: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
-      VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+      # Deliberately NOT named VERCEL_PROJECT_ID/VERCEL_ORG_ID/VERCEL_TOKEN:
+      # those are reserved names the Vercel CLI recognizes for its own
+      # env-var-based project auto-linking, which requires ALL of them to be
+      # set together or it hard-errors ("you forgot to specify
+      # VERCEL_ORG_ID") — we only want plain shell variables here and pass
+      # --project/--scope/--token explicitly on every command instead.
+      WS_PROJECT_ID: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
+      WS_TEAM_ID: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -582,26 +588,26 @@ jobs:
       - name: Deploy a dedicated WS-transport preview
         id: wsDeploy
         env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
+          WS_VERCEL_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
         run: |
           set -euo pipefail
           npx vercel@56.2.0 pull --yes --environment=preview \
-            --project="$VERCEL_PROJECT_ID" --scope="$VERCEL_TEAM" \
-            --token="$VERCEL_TOKEN" --cwd=workbench/express
+            --project="$WS_PROJECT_ID" --scope="$WS_TEAM_ID" \
+            --token="$WS_VERCEL_TOKEN" --cwd=workbench/express
           npx vercel@56.2.0 build \
-            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" --cwd=workbench/express
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" --cwd=workbench/express
           # `vercel deploy` writes the new deployment's URL to stdout and
           # progress/logs to stderr, specifically so it composes as
           # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
           # into this capture.
           URL=$(npx vercel@56.2.0 deploy --prebuilt --yes \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
-            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" --cwd=workbench/express)
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" --cwd=workbench/express)
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           # Best-effort: only used by the runtime-logs capture on failure,
           # which already skips gracefully if this doesn't parse.
           DEPLOYMENT_ID=$(npx vercel@56.2.0 inspect "$URL" --format=json \
-            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" 2>/dev/null \
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" 2>/dev/null \
             | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).id||'')}catch{}})" || true)
           echo "deploymentId=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
 
