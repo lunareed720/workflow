@@ -584,6 +584,7 @@ jobs:
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
       WORKFLOW_PUBLIC_MANIFEST: '1'
+      WS_TEAM_ID: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -623,19 +624,23 @@ jobs:
           # this file already works.
           vercel pull --yes --environment=preview \
             --project="${{ matrix.app.project-id }}" \
-            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN"
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN"
           # `vercel deploy` writes the new deployment's URL to stdout and
           # progress/logs to stderr, specifically so it composes as
           # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
-          # into this capture.
-          URL=$(vercel deploy --yes \
+          # into this capture. `--target=preview` is explicit here even
+          # though it's the default without `--prod` — these are shared,
+          # production-adjacent projects, and this shouldn't ever silently
+          # start deploying to their production aliases if a future edit
+          # changes flags around this call.
+          URL=$(vercel deploy --yes --target=preview \
             -e WORKFLOW_EVENTS_TRANSPORT=ws \
-            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN")
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN")
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           # Best-effort: only used by the runtime-logs capture on failure,
           # which already skips gracefully if this doesn't parse.
           DEPLOYMENT_ID=$(vercel inspect "$URL" --format=json \
-            --scope="team_nO2mCG4W8IxPIeKoSsqwAxxB" --token="$WS_VERCEL_TOKEN" 2>/dev/null \
+            --scope="$WS_TEAM_ID" --token="$WS_VERCEL_TOKEN" 2>/dev/null \
             | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).id||'')}catch{}})" || true)
           echo "deploymentId=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
 
@@ -652,7 +657,7 @@ jobs:
           APP_NAME: ${{ matrix.app.name }}
           WORKFLOW_VERCEL_ENV: "preview"
           WORKFLOW_VERCEL_AUTH_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
-          WORKFLOW_VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+          WORKFLOW_VERCEL_TEAM: ${{ env.WS_TEAM_ID }}
           WORKFLOW_VERCEL_PROJECT: ${{ matrix.app.project-id }}
           WORKFLOW_VERCEL_PROJECT_SLUG: ${{ matrix.app.project-slug }}
           VERCEL_WORKFLOW_SERVER_URL: ${{ github.ref != 'refs/heads/main' && secrets.VERCEL_WORKFLOW_SERVER_URL || '' }}
@@ -662,7 +667,7 @@ jobs:
         env:
           APP_NAME: ${{ matrix.app.name }}
           WORKFLOW_VERCEL_AUTH_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
-          WORKFLOW_VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+          WORKFLOW_VERCEL_TEAM: ${{ env.WS_TEAM_ID }}
           WORKFLOW_VERCEL_PROJECT: ${{ matrix.app.project-id }}
           WORKFLOW_VERCEL_ENV: "preview"
           VERCEL_DEPLOYMENT_ID: ${{ steps.wsDeploy.outputs.deploymentId }}
