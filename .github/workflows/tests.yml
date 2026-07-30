@@ -535,6 +535,119 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  e2e-vercel-ws-transport:
+    # Dedicated coverage for world-vercel's WebSocket events transport
+    # (WORKFLOW_EVENTS_TRANSPORT=ws — see events-v4.ts's
+    # isWsEventsTransportEnabled). Every other job in this file exercises
+    # the HTTP transport only, now that the WS-on-by-default POC hack is
+    # gone; this is the one deployment that turns WS on, and it does so via
+    # a per-deployment runtime env var on a dedicated preview deployment of
+    # the `express` project rather than any project-wide setting — so it
+    # can't leak into e2e-vercel-prod's deployment of the same project.
+    #
+    # Deliberately NOT using vercel/wait-for-deployment-action here: that
+    # action polls for a deployment Vercel's GitHub App creates passively in
+    # response to the push. We need a *second*, independent deployment of
+    # the same project with its own env var, so this job creates it directly
+    # via `vercel pull`/`build`/`deploy --prebuilt`, which also hands back
+    # the new deployment's URL synchronously (no polling needed).
+    name: E2E Vercel WS Transport Test (express)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: ci-scope
+    if: ${{ needs.ci-scope.outputs.fast-path != 'true' }}
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+      TURBO_TEAM: ${{ vars.TURBO_TEAM }}
+      WORKFLOW_PUBLIC_MANIFEST: '1'
+      VERCEL_PROJECT_ID: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
+      VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup environment
+        uses: ./.github/actions/setup-workflow-dev
+        with:
+          build-packages: 'false'
+
+      - name: Build CLI
+        run: pnpm turbo run build --filter='@workflow/cli'
+
+      - name: Deploy a dedicated WS-transport preview
+        id: wsDeploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
+        run: |
+          set -euo pipefail
+          npx vercel@56.2.0 pull --yes --environment=preview \
+            --project="$VERCEL_PROJECT_ID" --scope="$VERCEL_TEAM" \
+            --token="$VERCEL_TOKEN" --cwd=workbench/express
+          npx vercel@56.2.0 build \
+            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" --cwd=workbench/express
+          # `vercel deploy` writes the new deployment's URL to stdout and
+          # progress/logs to stderr, specifically so it composes as
+          # `url=$(vercel deploy ...)` in scripts — do not redirect stderr
+          # into this capture.
+          URL=$(npx vercel@56.2.0 deploy --prebuilt --yes \
+            -e WORKFLOW_EVENTS_TRANSPORT=ws \
+            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" --cwd=workbench/express)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          # Best-effort: only used by the runtime-logs capture on failure,
+          # which already skips gracefully if this doesn't parse.
+          DEPLOYMENT_ID=$(npx vercel@56.2.0 inspect "$URL" --format=json \
+            --scope="$VERCEL_TEAM" --token="$VERCEL_TOKEN" 2>/dev/null \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).id||'')}catch{}})" || true)
+          echo "deploymentId=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Record E2E start time
+        id: e2eStart
+        run: echo "ms=$(($(date +%s) * 1000))" >> "$GITHUB_OUTPUT"
+
+      - name: Run WS transport smoke test
+        run: pnpm vitest run packages/core/e2e/e2e.test.ts -t "addTenWorkflow" --reporter=verbose --reporter=json --reporter=./packages/core/e2e/github-reporter.ts "--outputFile=e2e-vercel-ws-transport.json"
+        env:
+          NODE_OPTIONS: "--enable-source-maps"
+          DEPLOYMENT_URL: ${{ steps.wsDeploy.outputs.url }}
+          APP_NAME: "express-ws-transport"
+          WORKFLOW_VERCEL_ENV: "preview"
+          WORKFLOW_VERCEL_AUTH_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
+          WORKFLOW_VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+          WORKFLOW_VERCEL_PROJECT: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
+          WORKFLOW_VERCEL_PROJECT_SLUG: "workbench-express-workflow"
+          VERCEL_WORKFLOW_SERVER_URL: ${{ github.ref != 'refs/heads/main' && secrets.VERCEL_WORKFLOW_SERVER_URL || '' }}
+
+      - name: Capture runtime logs on failure
+        if: failure()
+        env:
+          APP_NAME: "express-ws-transport"
+          WORKFLOW_VERCEL_AUTH_TOKEN: ${{ secrets.VERCEL_LABS_TOKEN }}
+          WORKFLOW_VERCEL_TEAM: "team_nO2mCG4W8IxPIeKoSsqwAxxB"
+          WORKFLOW_VERCEL_PROJECT: "prj_cCZjpBy92VRbKHHbarDMhOHtkuIr"
+          WORKFLOW_VERCEL_ENV: "preview"
+          VERCEL_DEPLOYMENT_ID: ${{ steps.wsDeploy.outputs.deploymentId }}
+          E2E_START_MS: ${{ steps.e2eStart.outputs.ms }}
+        run: node .github/scripts/fetch-e2e-runtime-logs.mjs
+
+      - name: Upload E2E results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-results-vercel-ws-transport
+          path: |
+            e2e-vercel-ws-transport.json
+            e2e-metadata-express-ws-transport-vercel.json
+            e2e-failures-express-ws-transport-vercel.json
+            e2e-diagnostics-express-ws-transport-vercel.json
+            e2e-runtime-logs-express-ws-transport-vercel.json
+          retention-days: 7
+          if-no-files-found: ignore
+
   getTestMatrix:
     name: Get Test Matrix
     runs-on: ubuntu-latest
@@ -1044,7 +1157,7 @@ jobs:
   summary:
     name: E2E Summary
     runs-on: ubuntu-latest
-    needs: [ci-scope, e2e-vercel-prod, e2e-local-dev, e2e-local-prod, e2e-local-postgres, e2e-windows]
+    needs: [ci-scope, e2e-vercel-prod, e2e-vercel-ws-transport, e2e-local-dev, e2e-local-prod, e2e-local-postgres, e2e-windows]
     if: always() && !cancelled() && needs.ci-scope.outputs.fast-path != 'true'
     timeout-minutes: 10
 
