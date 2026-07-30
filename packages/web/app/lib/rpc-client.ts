@@ -14,9 +14,9 @@ import type {
   WorkflowRunStatus,
 } from '@workflow/world';
 import { decode, encode } from 'cbor-x';
+import { apiBase } from '~/lib/api-base';
 import type {
   EnvMap,
-  HealthCheckEndpoint,
   HealthCheckResult,
   HookListItem,
   HookTokenResult,
@@ -28,7 +28,7 @@ import type {
 } from '~/lib/types';
 
 async function rpc<T>(method: string, params?: any): Promise<T> {
-  const res = await fetch('/api/rpc', {
+  const res = await fetch(`${apiBase()}/api/rpc`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/cbor',
@@ -226,10 +226,9 @@ export async function fetchWorkflowsManifest(
 
 export async function runHealthCheck(
   worldEnv: EnvMap,
-  endpoint: HealthCheckEndpoint,
   options?: { timeout?: number }
 ): Promise<ServerActionResult<HealthCheckResult>> {
-  return rpc('runHealthCheck', { worldEnv, endpoint, options });
+  return rpc('runHealthCheck', { worldEnv, options });
 }
 
 export async function getEncryptionKeyForRun(

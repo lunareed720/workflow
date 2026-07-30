@@ -5,6 +5,7 @@ import {
   mkdir,
   readdir,
   realpath,
+  rm,
   stat,
   writeFile,
 } from 'node:fs/promises';
@@ -15,6 +16,7 @@ import type {
 } from '@workflow/builders';
 import chokidar from 'chokidar';
 import type { NextConfig as ProjectNextConfig } from 'next';
+import { createWatchIgnorePredicate } from './watch-ignore.js';
 import {
   classifyRebuild,
   createSourceSnapshot,
@@ -59,6 +61,13 @@ export async function getNextBuilderEager(
 
       // Ensure output directories exist
       await mkdir(workflowGeneratedDir, { recursive: true });
+      if (!this.config.watch) {
+        // Production build caches may still contain the retired step route.
+        await rm(join(workflowGeneratedDir, 'step'), {
+          recursive: true,
+          force: true,
+        });
+      }
       await writeFile(join(workflowGeneratedDir, '.gitignore'), '*');
 
       const inputFiles = await this.getInputFiles();
@@ -128,8 +137,6 @@ export async function getNextBuilderEager(
           interimBundleCtx: combinedResult.interimBundleCtx,
           bundleFinal: combinedResult.bundleFinal,
         };
-        let workflowInterimBundleText =
-          combinedResult.workflowInterimBundleText;
         let discoveredEntries = combinedResult.discoveredEntries;
         let stepsManifest = combinedResult.stepsManifest;
         let workflowsManifest = combinedResult.workflowsManifest;
@@ -156,39 +163,30 @@ export async function getNextBuilderEager(
           '.cjs',
           '.mjs',
         ]);
-        const ignoredPathFragments = [
-          '/.git/',
-          '/node_modules/',
-          '/.next/',
-          '/.turbo/',
-          '/.vercel/',
-          '/dist/',
-          '/build/',
-          '/out/',
-          '/.cache/',
-          '/.yarn/',
-          '/.pnpm-store/',
-          '/.parcel-cache/',
-          '/.well-known/workflow/',
-        ];
         const normalizedGeneratedDir = workflowGeneratedDir.replace(/\\/g, '/');
         const normalizedDistDir = normalizePath(this.config.distDir);
-        ignoredPathFragments.push(normalizedGeneratedDir);
+
+        // Prune the dev watch set to keep chokidar from registering an
+        // fs.watch per directory across the whole project tree (chokidar 4
+        // dropped fsevents, so on macOS that exhausts the fd limit -> EMFILE
+        // on large monorepos). This honors `.gitignore` and the
+        // WORKFLOW_DEV_WATCH_IGNORED_PATHS env var in addition to the
+        // built-in fragments. The generated workflow dir is passed as an
+        // extra fragment so it is pruned regardless of `.gitignore`.
+        const isIgnoredWatchPath = createWatchIgnorePredicate({
+          workingDir: this.config.workingDir,
+          projectRoot: this.transformProjectRoot,
+          extraFragments: [normalizedGeneratedDir],
+        });
 
         const hasIgnoredPathFragment = (normalizedPath: string) => {
           if (
-            normalizedPath.startsWith(normalizedGeneratedDir) ||
             normalizedPath === normalizedDistDir ||
             normalizedPath.startsWith(`${normalizedDistDir}/`)
           ) {
             return true;
           }
-          for (const fragment of ignoredPathFragments) {
-            if (normalizedPath.includes(fragment)) {
-              return true;
-            }
-          }
-          return false;
+          return isIgnoredWatchPath(normalizedPath);
         };
 
         let rebuildQueue = Promise.resolve();
@@ -248,7 +246,6 @@ export async function getNextBuilderEager(
             );
           }
 
-          workflowInterimBundleText = workflowOutput;
           await workflowsCtx.bundleFinal(workflowOutput);
           await writeManifest(mergeCombinedManifest(stepsManifest));
         };
@@ -266,7 +263,6 @@ export async function getNextBuilderEager(
           discoveredEntries = newCombined.discoveredEntries;
           stepsManifest = newCombined.stepsManifest;
           workflowsManifest = newCombined.workflowsManifest;
-          workflowInterimBundleText = newCombined.workflowInterimBundleText;
 
           if (!newCombined?.interimBundleCtx || !newCombined?.bundleFinal) {
             throw new Error(
@@ -408,27 +404,6 @@ export async function getNextBuilderEager(
           addedFiles.length > 0 ||
           modifiedFiles.length > 0 ||
           removedFiles.length > 0;
-        const stepExecutionFilesChanged = (fileChanges: FileChanges) => {
-          const stepEntryFiles = [...discoveredEntries.discoveredSteps].map(
-            normalizePath
-          );
-          if (stepEntryFiles.length === 0) {
-            return false;
-          }
-          const changedFiles = unique([
-            ...fileChanges.modifiedFiles,
-            ...fileChanges.addedFiles,
-            ...fileChanges.removedFiles,
-          ]).map(normalizePath);
-
-          return changedFiles.some(
-            (changedFile) =>
-              stepEntryFiles.includes(changedFile) ||
-              stepEntryFiles.some((stepFile) =>
-                parentHasChild(stepFile, changedFile)
-              )
-          );
-        };
         const logDevHmr = (...args: unknown[]) => {
           if (process.env.WORKFLOW_DEV_HMR_LOGS === '1') {
             console.log(...args);
@@ -467,17 +442,6 @@ export async function getNextBuilderEager(
             logDevHmr('workflow dev hmr: skip');
             for (const [file, snapshot] of decision.snapshots || []) {
               sourceSnapshots.set(file, snapshot);
-            }
-            if (
-              !stepsCtx &&
-              workflowInterimBundleText &&
-              stepExecutionFilesChanged(fileChanges)
-            ) {
-              // Source step registrations keep stable imports, so Turbopack
-              // can leave the generated flow route cached after a
-              // step-body-only edit. Refresh the route wrapper without
-              // rediscovering entries or rebuilding the workflow VM.
-              await workflowsCtx.bundleFinal(workflowInterimBundleText);
             }
             return;
           }

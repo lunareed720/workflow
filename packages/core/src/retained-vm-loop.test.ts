@@ -87,6 +87,18 @@ registerSerializationClass(
   RetainedSerializerValue
 );
 
+// A parallel all-primitive batch: both parked step consumers schedule their
+// own (identical) suspension signal for the same boundary — the first one is
+// the suspension, the sibling must be absorbed by the generation guard
+// without demoting the session.
+const parallelBatchWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
+  const s2 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s2");
+  async function workflow() {
+    const [a, b] = await Promise.all([s1(1), s2(2)]);
+    return a + b;
+  }
+  globalThis.__private_workflows = new Map([["workflow", workflow]]);`;
+
 // A parallel batch where one sibling's input is unsafe must serialize the
 // WHOLE batch through the ordinary VM path (all-or-nothing) and demote.
 const mixedBatchWorkflow = `const s1 = globalThis[Symbol.for("WORKFLOW_USE_STEP")]("r_s1");
@@ -251,12 +263,15 @@ async function drive(runId: string, workflowCode = twoStepWorkflow) {
 
   await workflowEntrypoint(workflowCode)(new Request('https://example.test'));
 
-  const runCompleted = createdEvents.find(
-    (e) => e.eventType === 'run_completed'
-  );
+  const output = createdEvents.find((e) => e.eventType === 'run_completed')
+    ?.eventData?.output as Uint8Array | undefined;
   return {
     vmBuilds: createContextSpy.mock.calls.length,
-    output: runCompleted?.eventData?.output as Uint8Array | undefined,
+    output,
+    result:
+      output === undefined
+        ? undefined
+        : await hydrateWorkflowReturnValue(output, runId, undefined, []),
   };
 }
 
@@ -272,100 +287,59 @@ describe('retained VM through the inline replay loop', () => {
 
   it('rebuilds the VM once per replay under the kill switch (WORKFLOW_RETAINED_VM=0)', async () => {
     process.env.WORKFLOW_RETAINED_VM = '0';
-    const { vmBuilds, output } = await drive('wrun_retained_off');
-    expect(output).toBeInstanceOf(Uint8Array);
-    // A 2-step sequential workflow suspends twice then completes → >1 replay,
-    // each building a fresh VM.
+    const { vmBuilds, result } = await drive('wrun_retained_off');
+    expect(result).toBe(30);
+    // 2 sequential steps → 2 suspensions + completion → 3 replays, each
+    // building a fresh VM.
     expect(vmBuilds).toBeGreaterThan(1);
   });
 
-  it('builds the VM once and resumes it when retention is ON (the default)', async () => {
-    // Baseline via the kill switch, to compare the dehydrated result against.
+  it('builds the VM once when retention is ON (the default), with byte-identical output', async () => {
+    // Baseline via the kill switch, to compare the dehydrated bytes against.
     process.env.WORKFLOW_RETAINED_VM = '0';
     const off = await drive('wrun_retained_baseline_off');
     createContextSpy.mockClear();
-
-    // Unset → retention is ON by default.
     delete process.env.WORKFLOW_RETAINED_VM;
-    const on = await drive('wrun_retained_on');
 
-    expect(on.output).toBeInstanceOf(Uint8Array);
-    // The whole run is served by a single VM: built once on the first pass,
-    // resumed (not rebuilt) for every subsequent step.
+    const on = await drive('wrun_retained_on');
+    expect(on.result).toBe(30);
+    // One VM for the whole run: built on the first pass, resumed after.
     expect(on.vmBuilds).toBe(1);
-    // And it produces the identical dehydrated result as the replay path.
     expect(on.output).toEqual(off.output);
   });
 
-  it('matches cold replay when argument serialization mutates workflow state', async () => {
+  it.each([
+    ['an argument getter', impureArgsWorkflow, 'impure_args'],
+    ['a custom serializer', impureSerializerWorkflow, 'impure_serializer'],
+  ])('matches cold replay when %s mutates workflow state', async (_name, workflowCode, slug) => {
     process.env.WORKFLOW_RETAINED_VM = '0';
-    const off = await drive(
-      'wrun_retained_impure_args_off',
-      impureArgsWorkflow
-    );
+    const off = await drive(`wrun_${slug}_off`, workflowCode);
     createContextSpy.mockClear();
-
     delete process.env.WORKFLOW_RETAINED_VM;
-    const on = await drive('wrun_retained_impure_args_on', impureArgsWorkflow);
 
+    const on = await drive(`wrun_${slug}_on`, workflowCode);
+    // The boundary demoted (multiple VMs), and the result is what a cold
+    // replay computes: the serialization-time mutation is NOT visible.
     expect(on.vmBuilds).toBeGreaterThan(1);
-    expect(
-      await hydrateWorkflowReturnValue(
-        off.output,
-        'wrun_retained_impure_args_off',
-        undefined,
-        []
-      )
-    ).toBe(0);
-    expect(
-      await hydrateWorkflowReturnValue(
-        on.output,
-        'wrun_retained_impure_args_on',
-        undefined,
-        []
-      )
-    ).toBe(0);
+    expect(off.result).toBe(0);
+    expect(on.result).toBe(0);
   });
 
-  it('matches cold replay when a custom serializer mutates workflow state', async () => {
-    process.env.WORKFLOW_RETAINED_VM = '0';
-    const off = await drive(
-      'wrun_retained_impure_serializer_off',
-      impureSerializerWorkflow
+  it('retains one VM for a parallel batch (sibling suspension signals absorbed)', async () => {
+    const { vmBuilds, result } = await drive(
+      'wrun_retained_parallel_batch',
+      parallelBatchWorkflow
     );
-    createContextSpy.mockClear();
-
-    delete process.env.WORKFLOW_RETAINED_VM;
-    const on = await drive(
-      'wrun_retained_impure_serializer_on',
-      impureSerializerWorkflow
-    );
-
-    expect(on.vmBuilds).toBeGreaterThan(1);
-    expect(
-      await hydrateWorkflowReturnValue(
-        off.output,
-        'wrun_retained_impure_serializer_off',
-        undefined,
-        []
-      )
-    ).toBe(0);
-    expect(
-      await hydrateWorkflowReturnValue(
-        on.output,
-        'wrun_retained_impure_serializer_on',
-        undefined,
-        []
-      )
-    ).toBe(0);
+    expect(result).toBe(30);
+    expect(vmBuilds).toBe(1);
   });
 
   it('demotes retention when any input in a parallel batch is unsafe', async () => {
-    const { vmBuilds, output } = await drive(
+    const { vmBuilds, result } = await drive(
       'wrun_retained_mixed_batch',
       mixedBatchWorkflow
     );
-    expect(output).toBeInstanceOf(Uint8Array);
+    expect(result).toBe(30);
     expect(vmBuilds).toBeGreaterThan(1);
   });
 
@@ -406,11 +380,11 @@ describe('retained VM through the inline replay loop', () => {
   });
 
   it('retains a VM that used the synchronous crypto.subtle.digest', async () => {
-    const { vmBuilds, output } = await drive(
+    const { vmBuilds, result } = await drive(
       'wrun_retained_digest',
       digestWorkflow
     );
-    expect(output).toBeInstanceOf(Uint8Array);
+    expect(result).toBe(30);
     expect(vmBuilds).toBe(1);
   });
 });

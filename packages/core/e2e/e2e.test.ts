@@ -443,6 +443,33 @@ describe('e2e', () => {
     expect(returnValue).toBe('B');
   });
 
+  // Interleaves VM-retention modes: retained boundaries (primitive step
+  // args), demoted boundaries (object args), sleeps, a step-vs-sleep race,
+  // and a hook resolved in parallel with a step. Asserts the exact composite
+  // result so a dropped/duplicated/misordered boundary fails loudly.
+  test('retainedInterleavingWorkflow', { timeout: 90_000 }, async () => {
+    const token = Math.random().toString(36).slice(2);
+    const run = await start(await e2e('retainedInterleavingWorkflow'), [
+      token,
+    ]);
+
+    const hook = await waitForHook(token, { runId: run.runId });
+    await resumeHook(hook, { delta: 5 });
+
+    const returnValue = await run.returnValue;
+    expect(returnValue).toEqual({
+      a: 3,
+      b: 3,
+      c: 13,
+      d: 23,
+      e: 13,
+      f: 24,
+      winner: 'step',
+      g: 137,
+      h: 142,
+    });
+  });
+
   test.skipIf(!isNext)(
     'importedStepOnlyWorkflow',
     { timeout: 60_000 },
@@ -1298,7 +1325,7 @@ describe('e2e', () => {
             expect(failedStep.status).toBe('failed');
             // The CLI hydrates `step.error` from the serialization pipeline.
             // Errors thrown from steps are wrapped in `FatalError` by the
-            // step handler, which serializes via the Instance reducer
+            // step executor, which serializes via the Instance reducer
             // (`{ classId, data }`); the CLI surfaces unregistered class
             // instances as placeholders with the original `data` payload.
             const errorData = failedStep.error.data ?? failedStep.error;
@@ -2544,7 +2571,7 @@ describe('e2e', () => {
 
   // This test requires direct HTTP access and works when running locally.
   // For production use on Vercel with Deployment Protection enabled, use the
-  // queue-based `healthCheck(world, endpoint, options)` function instead, which
+  // queue-based `healthCheck(world, options)` function instead, which
   // bypasses protection by sending messages through the Queue infrastructure.
   test.skipIf(!isLocalDeployment())(
     'health check endpoint (HTTP) - workflow endpoint responds to __health query parameter',
@@ -2554,7 +2581,7 @@ describe('e2e', () => {
       // This approach requires direct HTTP access and works when running locally (for port detection)
       //
       // For production use on Vercel with Deployment Protection enabled, use the
-      // queue-based `healthCheck(world, endpoint, options)` function instead, which
+      // queue-based `healthCheck(world, options)` function instead, which
       // bypasses protection by sending messages through the Queue infrastructure.
 
       // Test the flow endpoint health check (V2: combined handler for both workflow + step)
@@ -2591,7 +2618,7 @@ describe('e2e', () => {
       const world = await getWorld();
 
       // Test workflow endpoint health check (V2: combined handler)
-      const workflowResult = await healthCheck(world, 'workflow', {
+      const workflowResult = await healthCheck(world, {
         timeout: 30000,
       });
       expect(workflowResult.healthy).toBe(true);
@@ -2610,10 +2637,7 @@ describe('e2e', () => {
       // queue-based health check under the hood. The CLI provides a convenient
       // way to check endpoint health from the command line.
 
-      // V2: Only check the workflow endpoint since the combined handler
-      // replaces the separate step route.
       const result = await cliHealthJson({
-        endpoint: 'workflow',
         timeout: 30000,
       });
       expect(result.json.allHealthy).toBe(true);
@@ -3673,7 +3697,7 @@ describe('e2e', () => {
         const returnValue = await run.returnValue;
 
         // The step calls throwIfAborted() on an already-aborted signal.
-        // The DOMException is wrapped in FatalError by the step handler.
+        // The DOMException is wrapped in FatalError by the step executor.
         expect(returnValue.threw).toBe(true);
         expect(returnValue.isFatal).toBe(true);
       }
@@ -3820,7 +3844,7 @@ describe('e2e', () => {
         const returnValue = await run.returnValue;
 
         // The polling step's throwIfAborted() throws a DOMException once the
-        // abort fires mid-flight. The step handler wraps that as FatalError
+        // abort fires mid-flight. The step executor wraps that as FatalError
         // (no retries). A `result: 'completed'` would mean the abort never
         // reached the polling step.
         expect(returnValue.threw).toBe(true);

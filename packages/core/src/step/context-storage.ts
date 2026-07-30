@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { CryptoKey } from '../encryption.js';
+import type { PayloadKey } from '../serialization/encryption.js';
 import type { FlushableStreamState } from '../flushable-stream.js';
 import type { WorkflowMetadata } from '../workflow/get-workflow-metadata.js';
 import type { StepMetadata } from './get-step-metadata.js';
@@ -57,7 +57,7 @@ export type StepContext = {
    */
   preCompletionOps: Promise<void>[];
   closureVars?: Record<string, any>;
-  encryptionKey?: CryptoKey;
+  encryptionKey?: PayloadKey;
   writables?: Map<string, CachedWritable>;
   /**
    * Turbo mode only: a promise that resolves once the backgrounded
@@ -76,7 +76,7 @@ export type StepContext = {
  *
  * Uses `Symbol.for()` on globalThis to guarantee a single instance even when
  * bundlers (e.g. Vercel's production bundler) create multiple copies of this
- * module. Without this, `contextStorage.run()` in the step handler and
+ * module. Without this, `contextStorage.run()` in the step executor and
  * `contextStorage.getStore()` in user code (via getWorkflowMetadata /
  * getStepMetadata) can reference different AsyncLocalStorage instances,
  * causing the store to appear empty.

@@ -1,3 +1,4 @@
+import type { Span } from '@opentelemetry/api';
 import {
   ERROR_SLUGS,
   ReplayDivergenceError,
@@ -14,7 +15,7 @@ import type { Event, WorkflowRun, WorldCapabilities } from '@workflow/world';
 import { SPEC_VERSION_SUPPORTS_COMPRESSION } from '@workflow/world';
 import * as nanoid from 'nanoid';
 import { monotonicFactory } from 'ulid';
-import type { CryptoKey } from './encryption.js';
+import type { PayloadKey } from './serialization/encryption.js';
 import { EventConsumerResult, EventsConsumer } from './events-consumer.js';
 import type { QueueItem } from './global.js';
 import { ENOTSUP, WorkflowSuspension } from './global.js';
@@ -58,31 +59,15 @@ import { createSleep } from './workflow/sleep.js';
 /**
  * Drain pending queue items at workflow completion (success or failure).
  *
- * Treats end-of-run like a final suspension: any operation the workflow code
- * spawned but didn't `await` — abort hook resumes, hook creations/disposals,
- * sleep waits, step queueings — gets committed to the event log via the
- * suspension handler before the run is marked terminal.
+ * Treats completion as a final suspension so unawaited hook, wait, and
+ * attribute operations are recorded before the run becomes terminal. This
+ * also lets a final `controller.abort()` reach in-flight steps.
  *
- * This matches normal JS semantics where `setTimeout(fn, ...)` etc. continue
- * running after the surrounding function returns. Most importantly, it ensures
- * `controller.abort()` called as the last statement of a workflow actually
- * propagates to in-flight steps on other compute instances — without this,
- * the abort hook is created but never resumed and the cancellation never
- * reaches the running step.
+ * It records `*_created` and native attribute events, but never executes step
+ * bodies: `step_started` is rejected after the run becomes terminal. A
+ * fire-and-forget step therefore needs a later suspension to be scheduled.
  *
- * NOTE: drain commits native attribute events and the `*_created` events; it
- * does NOT enqueue step
- * bodies for execution. The platform's step worker rejects `step_started`
- * for runs that have already transitioned to terminal (`RunExpiredError`),
- * so a step queued here would be skipped anyway. Fire-and-forget step calls
- * with side effects therefore work only when followed by some later `await`
- * on a runtime primitive that triggers a real suspension (the normal
- * runtime loop in `runtime.ts` queues the step there). Native attribute writes
- * do not have this limitation because their event is the durable write.
- *
- * Drain failures are swallowed: the workflow's own outcome (the user's return
- * value or thrown error) is the source of truth; secondary cleanup that fails
- * shouldn't change the run's terminal state.
+ * Drain failures do not change the workflow's terminal outcome.
  */
 async function drainPendingQueueItems(
   runId: string,
@@ -91,13 +76,8 @@ async function drainPendingQueueItems(
   workflowRun: WorkflowRun,
   outcome: 'completed' | 'failed',
   /**
-   * Turbo mode only: resolves once the backgrounded `run_started` has landed.
-   * The drain runs at workflow completion *inside* `runWorkflow`, before the
-   * caller's terminal `awaitRunReady()` — so a workflow that creates a
-   * fire-and-forget hook (or wait/attribute) and then returns synchronously
-   * would otherwise have its `*_created` write race ahead of `run_started`.
-   * Threading the barrier into the suspension handler gates those writes the
-   * same way the normal suspension path is gated. Undefined outside turbo.
+   * In turbo mode, gates final `*_created` writes on backgrounded
+   * `run_started`. Undefined when `run_started` is awaited.
    */
   runReadyBarrier?: Promise<unknown>
 ): Promise<void> {
@@ -138,11 +118,48 @@ async function drainPendingQueueItems(
   }
 }
 
-interface WorkflowCompletion {
-  readonly output: unknown;
-  readonly resultType: string;
+/** Everything needed to cold-start a workflow VM over an event log. */
+interface WorkflowSessionOptions {
+  readonly workflowCode: string;
+  readonly workflowRun: WorkflowRun;
+  readonly events: Event[];
+  readonly encryptionKey: PayloadKey | undefined;
+  readonly replayPayloadCache: ReplayPayloadCache;
+  readonly runReadyBarrier?: Promise<unknown>;
+  readonly worldCapabilities?: WorldCapabilities;
 }
 
+/**
+ * A live workflow VM, parked at a suspension boundary. `resume` advances it
+ * by appending events instead of replaying from scratch.
+ */
+export interface WorkflowSession {
+  readonly workflowRun: WorkflowRun;
+  readonly argumentCount: number;
+  resume(events: Event[]): Promise<WorkflowResumeResult>;
+}
+
+/** A finished execution attempt: the workflow's output or a live boundary. */
+export type WorkflowResult =
+  | {
+      readonly type: 'completed';
+      readonly output: unknown;
+      /** `typeof` the raw return value, for telemetry. */
+      readonly resultType: string;
+    }
+  | {
+      readonly type: 'suspended';
+      readonly suspension: WorkflowSuspension;
+      readonly session: WorkflowSession;
+    };
+
+/**
+ * `resume` can additionally decline — `{ type: 'replay' }` means "this
+ * session is unusable, cold-replay instead". A fresh replay never declines.
+ */
+export type WorkflowResumeResult = WorkflowResult | { readonly type: 'replay' };
+
+/** The session's private state machine. */
 type WorkflowSessionState =
   | {
       readonly type: 'running';
@@ -152,118 +169,85 @@ type WorkflowSessionState =
   | { readonly type: 'replay' }
   | { readonly type: 'completed' };
 
-export interface WorkflowSession {
-  readonly workflowRun: WorkflowRun;
-  readonly argumentCount: number;
-  resume(events: Event[]): WorkflowSessionResumeResult;
-}
-
-type WorkflowSessionResumeResult =
-  | {
-      readonly type: 'resumed';
-      readonly execution: Promise<WorkflowCompletion>;
+/** Cold-start: build a fresh VM session and replay it over `events`. */
+export function replayWorkflow(
+  options: WorkflowSessionOptions
+): Promise<WorkflowResult> {
+  return traceExecution(
+    'replay',
+    options.workflowRun,
+    options.events,
+    async (span) => {
+      const { session, execution } = await createWorkflowSession(options);
+      span?.setAttributes({
+        ...Attribute.WorkflowArgumentsCount(session.argumentCount),
+      });
+      return recordResult(await execution, span);
     }
-  | { readonly type: 'replay' };
-
-interface WorkflowSessionOptions {
-  readonly workflowCode: string;
-  readonly workflowRun: WorkflowRun;
-  readonly events: Event[];
-  readonly encryptionKey: CryptoKey | undefined;
-  readonly replayPayloadCache: ReplayPayloadCache;
-  readonly runReadyBarrier?: Promise<unknown>;
-  readonly worldCapabilities?: WorldCapabilities;
+  );
 }
 
-type WorkflowExecutionRequest =
-  | ({ readonly type: 'replay' } & WorkflowSessionOptions)
-  | {
-      readonly type: 'resume';
-      readonly session: WorkflowSession;
-      readonly events: Event[];
-    };
+/** Warm-start: advance a retained session by appending events. */
+export function resumeWorkflow(
+  session: WorkflowSession,
+  events: Event[]
+): Promise<WorkflowResumeResult> {
+  return traceExecution(
+    'retained',
+    session.workflowRun,
+    events,
+    async (span) => {
+      span?.setAttributes({
+        ...Attribute.WorkflowArgumentsCount(session.argumentCount),
+      });
+      const result = await session.resume(events);
+      return result.type === 'replay' ? result : recordResult(result, span);
+    }
+  );
+}
 
-type WorkflowReplayResult =
-  | { readonly type: 'completed'; readonly output: unknown }
-  | {
-      readonly type: 'suspended';
-      readonly suspension: WorkflowSuspension;
-      readonly session: WorkflowSession;
-    };
-
-export type WorkflowExecutionResult =
-  | { readonly type: 'replay' }
-  | WorkflowReplayResult;
-
-// A fresh replay always completes or suspends; only resuming a session can
-// request another replay (stale session or diverged event prefix).
-export async function executeWorkflow(
-  request: { readonly type: 'replay' } & WorkflowSessionOptions
-): Promise<WorkflowReplayResult>;
-export async function executeWorkflow(
-  request: WorkflowExecutionRequest
-): Promise<WorkflowExecutionResult>;
-export async function executeWorkflow(
-  request: WorkflowExecutionRequest
-): Promise<WorkflowExecutionResult> {
-  const workflowRun =
-    request.type === 'replay'
-      ? request.workflowRun
-      : request.session.workflowRun;
-  const mode = request.type === 'replay' ? 'replay' : 'retained';
-
-  return trace(`workflow.run ${workflowRun.workflowName}`, async (span) => {
+function traceExecution<T>(
+  mode: 'replay' | 'retained',
+  workflowRun: WorkflowRun,
+  events: Event[],
+  fn: (span: Span | undefined) => Promise<T>
+): Promise<T> {
+  return trace(`workflow.run ${workflowRun.workflowName}`, (span) => {
     span?.setAttributes({
       ...Attribute.WorkflowName(workflowRun.workflowName),
       ...Attribute.WorkflowRunId(workflowRun.runId),
       ...Attribute.WorkflowRunStatus(workflowRun.status),
-      ...Attribute.WorkflowEventsCount(request.events.length),
+      ...Attribute.WorkflowEventsCount(events.length),
       ...Attribute.WorkflowExecutionMode(mode),
     });
-
-    let session: WorkflowSession;
-    let execution: Promise<WorkflowCompletion>;
-    switch (request.type) {
-      case 'replay': {
-        const started = await createWorkflowSession(request);
-        session = started.session;
-        execution = started.execution;
-        break;
-      }
-      case 'resume': {
-        session = request.session;
-        const resumed = session.resume(request.events);
-        if (resumed.type === 'replay') return resumed;
-        execution = resumed.execution;
-        break;
-      }
-    }
-
-    span?.setAttributes({
-      ...Attribute.WorkflowArgumentsCount(session.argumentCount),
-    });
-
-    try {
-      const completed = await execution;
-      span?.setAttributes({
-        ...Attribute.WorkflowResultType(completed.resultType),
-      });
-      return { type: 'completed', output: completed.output };
-    } catch (error) {
-      if (WorkflowSuspension.is(error)) {
-        if (span) applyWorkflowSuspensionToSpan(error, span);
-        return { type: 'suspended', suspension: error, session };
-      }
-      throw error;
-    }
+    return fn(span);
   });
 }
 
+function recordResult(
+  result: WorkflowResult,
+  span: Span | undefined
+): WorkflowResult {
+  if (result.type === 'completed') {
+    span?.setAttributes({
+      ...Attribute.WorkflowResultType(result.resultType),
+    });
+  } else if (span) {
+    applyWorkflowSuspensionToSpan(result.suspension, span);
+  }
+  return result;
+}
+
+/**
+ * Single-shot replay: execute the workflow over `events` and either return
+ * its output or throw its suspension. Kept for the extensive existing test
+ * suites — production code goes through `replayWorkflow`/`resumeWorkflow`.
+ */
 export async function runWorkflow(
   workflowCode: string,
   workflowRun: WorkflowRun,
   events: Event[],
-  encryptionKey: CryptoKey | undefined,
+  encryptionKey: PayloadKey | undefined,
   /**
    * Optional per-run cache for replay payload preparation and immutable final
    * values. Owned by the inline execution loop for this invocation.
@@ -284,8 +268,7 @@ export async function runWorkflow(
    */
   worldCapabilities?: WorldCapabilities
 ): Promise<Uint8Array | unknown> {
-  const result = await executeWorkflow({
-    type: 'replay',
+  const result = await replayWorkflow({
     workflowCode,
     workflowRun,
     events,
@@ -308,7 +291,7 @@ async function createWorkflowSession({
   worldCapabilities,
 }: WorkflowSessionOptions): Promise<{
   session: WorkflowSession;
-  execution: Promise<WorkflowCompletion>;
+  execution: Promise<WorkflowResult>;
 }> {
   const startedAt = workflowRun.startedAt;
   if (!startedAt) {
@@ -317,26 +300,12 @@ async function createWorkflowSession({
     );
   }
 
-  // The deterministic RNG seed is derived from identifiers that are all
-  // known the instant the queue message arrives — `runId`, `workflowName`,
-  // and `deploymentId` — with no timestamp component. `runId` alone already
-  // makes the seed unique-per-run and replay-stable; `workflowName` and
-  // `deploymentId` are included for extra entropy. Dropping the timestamp
-  // means the seed no longer depends on `startedAt`/`createdAt`, so it (and
-  // the VM context) can be computed before any server round-trip.
-  //
-  // The VM's initial fixed clock is derived from the run's creation time,
-  // recovered from the ULID embedded in `runId` (also available immediately),
-  // falling back to the run snapshot's `createdAt` for non-ULID ids. This
-  // initial `fixedTimestamp` only governs `Date.now()` / `new Date()` in the
-  // window before the first event is consumed; thereafter `updateTimestamp`
-  // advances the VM clock to each consumed event's `createdAt` (see the
-  // EventsConsumer below), starting with `run_created`.
+  // Seed and initial clock must be available before I/O and remain stable on
+  // replay. After the first event, EventsConsumer advances the VM clock from
+  // each event's `createdAt`.
   const fixedTimestamp =
     runIdCreatedAt(workflowRun.runId) ?? +workflowRun.createdAt;
 
-  // Get the port before creating VM context to avoid async operations
-  // affecting the deterministic timestamp
   const isVercel = process.env.VERCEL_URL !== undefined;
   // Load getPort lazily to prevent Turbopack from tracing get-port's
   // fs ops (readdir, readFile) into the flow route bundle. The resolved
@@ -376,23 +345,20 @@ async function createWorkflowSession({
         state = WorkflowSuspension.is(error)
           ? { type: 'suspended', suspension: error }
           : { type: 'replay' };
+        // Each parked step consumer schedules its own (identical) suspension
+        // signal; the first one lands here, and bumping the generation makes
+        // the step-consumer guard drop the rest at fire time.
+        workflowContext.suspensionGeneration++;
         interruption.reject(error);
         return;
       }
-      case 'suspended': {
-        // A suspended VM is quiescent, but each parked step consumer
-        // signals its own (identical) suspension via scheduleWhenIdle —
-        // absorb those duplicates, treat anything else as unretainable.
-        // The suspension counts are all derived from `steps`, so identical
-        // items mean an identical boundary.
-        const { steps } = state.suspension;
-        const isDuplicateSignal =
-          WorkflowSuspension.is(error) &&
-          error.steps.length === steps.length &&
-          error.steps.every((item, index) => item === steps[index]);
-        if (!isDuplicateSignal) state = { type: 'replay' };
+      case 'suspended':
+        // Same-boundary duplicates were staled by the generation bump above,
+        // so anything landing here is out-of-band — an unguarded sleep/hook/
+        // attribute signal or a divergence. Those boundaries are unretainable
+        // (the runtime demotes them too), so fall back to replay.
+        state = { type: 'replay' };
         return;
-      }
       case 'replay':
       case 'completed':
         return;
@@ -432,15 +398,8 @@ async function createWorkflowSession({
     globalThis: vmGlobalThis,
     onWorkflowError,
     eventsConsumer,
-    // Correlation IDs (step_/wait_/hook_) are derived from `generateUlid`, so
-    // the time prefix fed to `ulid()` MUST be replay-stable across every
-    // delivery — otherwise a redelivery regenerates different correlation IDs
-    // and replay throws ReplayDivergenceError. `startedAt` is NOT safe here:
-    // under turbo the first delivery synthesizes `startedAt` from the local
-    // clock, but later (non-turbo) deliveries load the server-canonical
-    // `startedAt`, which differs by >=1ms. Use the same replay-stable value
-    // that already seeds the RNG and the VM clock (`fixedTimestamp`, recovered
-    // from the run ID's ULID and known the instant the message arrives).
+    // Correlation IDs must be replay-stable. `startedAt` differs between a
+    // turbo delivery and a later server-backed replay, so use fixedTimestamp.
     generateUlid: () => ulid(fixedTimestamp),
     generateNanoid,
     invocationsQueue: new Map(),
@@ -520,8 +479,7 @@ async function createWorkflowSession({
   // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
   vmGlobalThis[STABLE_ULID] = ulid;
 
-  // NOTE: Will have a config override to use the custom fetch step.
-  //       For now `fetch` must be explicitly imported from `workflow`.
+  // Workflow code must import the deterministic `fetch` step from `workflow`.
   vmGlobalThis.fetch = () => {
     throw new vmGlobalThis.Error(
       `Global "fetch" is unavailable in workflow functions. Use the "fetch" step function from "workflow" to make HTTP requests.\n\nLearn more: https://workflow-sdk.dev/err/${ERROR_SLUGS.FETCH_IN_WORKFLOW_FUNCTION}`
@@ -997,11 +955,9 @@ async function createWorkflowSession({
   }
   vmGlobalThis.TransformStream = TransformStream;
 
-  // Eventually we'll probably want to provide our own `console` object,
-  // but for now we'll just expose the global one.
   vmGlobalThis.console = globalThis.console;
 
-  // HACK: propagate symbol needed for AI gateway usage
+  // Expose the request-context symbol required by AI Gateway.
   const SYMBOL_FOR_REQ_CONTEXT = Symbol.for('@vercel/request-context');
   // @ts-expect-error - `@types/node` says symbol is not valid, but it does work
   vmGlobalThis[SYMBOL_FOR_REQ_CONTEXT] = (globalThis as any)[
@@ -1014,24 +970,9 @@ async function createWorkflowSession({
   const parsedName = parseWorkflowName(workflowRun.workflowName);
   const filename = parsedName?.moduleSpecifier || workflowRun.workflowName;
 
-  // Evaluate the workflow bundle against the fresh context using a
-  // process-wide cache of the compiled `vm.Script`. The bundle is the same
-  // string for every replay and every invocation in this process, and
-  // compilation is a pure function of `(code, filename)`, so reusing the
-  // compiled Script across replays is determinism-safe: it produces the same
-  // workflow function and the same `filename` source attribution as
-  // re-parsing the bundle every time, but skips the (expensive) re-parse.
-  // Evaluating the bundle registers every workflow on
-  // `globalThis.__private_workflows`; the trailing lookup expression then
-  // retrieves the requested workflow function. The lookup is evaluated as a
-  // separate cached Script under the same `filename`, so error stack frames
-  // still attribute to the workflow's source file (`remapErrorStack` keys on
-  // `filename`). The one behavioural difference from the previous
-  // single-combined-string approach is the *line number* of an error thrown
-  // by the lookup expression itself: it now reports line 1 of the lookup
-  // Script rather than the line just past the end of the bundle. That path
-  // is rare (it requires the lookup `?.get(...)` expression to throw) and
-  // does not affect the workflow function or replay determinism.
+  // Reuse compiled scripts by `(code, filename)`: compilation is deterministic
+  // and the filename preserves workflow source attribution in stack traces.
+  // The bundle registers workflows on `globalThis.__private_workflows`.
   runCachedWorkflowScript(workflowCode, filename, context);
   const workflowFn = runCachedWorkflowScript(
     `globalThis.__private_workflows?.get(${JSON.stringify(workflowRun.workflowName)})`,
@@ -1061,7 +1002,10 @@ async function createWorkflowSession({
   });
   await workflowContext.promiseQueue;
 
-  const workflowExecution = (async (): Promise<unknown> => {
+  // The user function's promise. It may stay pending across many resumes
+  // (each parked step promise holds it up) and is raced against the current
+  // attempt's interruption in waitForExecution.
+  const workflowBody = (async (): Promise<unknown> => {
     return await workflowFn(...args);
   })();
 
@@ -1092,13 +1036,13 @@ async function createWorkflowSession({
 
   const waitForExecution = async (
     interruption: PromiseWithResolvers<never>
-  ): Promise<WorkflowCompletion> => {
+  ): Promise<WorkflowResult> => {
     let result: unknown;
     try {
-      result = await Promise.race([workflowExecution, interruption.promise]);
+      result = await Promise.race([workflowBody, interruption.promise]);
     } catch (error) {
       if (state.type === 'suspended' && error === state.suspension) {
-        throw error;
+        return { type: 'suspended', suspension: state.suspension, session };
       }
       return failWorkflow(error);
     }
@@ -1111,9 +1055,8 @@ async function createWorkflowSession({
         encryptionKey,
         vmGlobalThis,
         false,
-        // Gate payload compression on the run's specVersion: only runs
-        // marked as possibly containing compressed payloads (spec >= 5)
-        // get gzip data.
+        // Only compression-capable runs (spec >= 5) may write compressed
+        // payloads. The serializer uses zstd when supported and may use gzip.
         (workflowRun.specVersion ?? 0) >= SPEC_VERSION_SUPPORTS_COMPRESSION
       );
 
@@ -1126,7 +1069,7 @@ async function createWorkflowSession({
         runReadyBarrier
       );
 
-      return { output, resultType: typeof result };
+      return { type: 'completed', output, resultType: typeof result };
     } catch (error) {
       return failWorkflow(error);
     }
@@ -1135,13 +1078,18 @@ async function createWorkflowSession({
   const session: WorkflowSession = {
     workflowRun,
     argumentCount: args.length,
-    resume(nextEvents) {
+    async resume(nextEvents) {
       switch (state.type) {
         case 'suspended': {
-          const consumedEvents = eventsConsumer.events;
+          // The full O(known events) prefix compare is required: the runtime
+          // usually grows one array in place, but its wait-completion and
+          // stale-reload paths REPLACE the array with a fresh full fetch, so
+          // a rewritten prefix is a real input, not paranoia. The compares
+          // are cheap string equality and dwarfed by the replay they avoid.
+          const knownEvents = eventsConsumer.events;
           const isStrictExtension =
-            nextEvents.length > consumedEvents.length &&
-            consumedEvents.every(
+            nextEvents.length > knownEvents.length &&
+            knownEvents.every(
               (event, index) => event.eventId === nextEvents[index]?.eventId
             );
           if (!isStrictExtension) {
@@ -1151,11 +1099,8 @@ async function createWorkflowSession({
           const interruption = withResolvers<never>();
           state = { type: 'running', interruption };
           workflowContext.suspensionGeneration++;
-          eventsConsumer.append(nextEvents.slice(consumedEvents.length));
-          return {
-            type: 'resumed',
-            execution: waitForExecution(interruption),
-          };
+          eventsConsumer.append(nextEvents.slice(knownEvents.length));
+          return waitForExecution(interruption);
         }
         case 'replay':
           return { type: 'replay' };

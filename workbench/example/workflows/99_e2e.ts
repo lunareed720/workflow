@@ -246,6 +246,48 @@ export async function stepWinsRaceWorkflow() {
 
 //////////////////////////////////////////////////////////
 
+// Takes an OBJECT argument: under VM retention (WORKFLOW_RETAINED_VM), a
+// boundary whose new step has a non-primitive input falls back to cold
+// replay instead of resuming the retained VM.
+async function unwrapValue(box: { value: number }) {
+  'use step';
+  return box.value;
+}
+
+/**
+ * Interleaves every retention mode the runtime can hit: retained boundaries
+ * (primitive step args), demoted boundaries (object args), wait boundaries
+ * (sleep, step-vs-sleep race), and a hook awaited in parallel with a step.
+ * The chained arithmetic makes any dropped, duplicated, or misordered
+ * boundary visible in the final output.
+ */
+export async function retainedInterleavingWorkflow(token: string) {
+  'use workflow';
+  // Retained: sequential primitive-arg step.
+  const a = await add(1, 2); // 3
+  // Demoted: object argument.
+  const b = await unwrapValue({ value: a }); // 3
+  // Retained: parallel all-primitive batch.
+  const [c, d] = await Promise.all([add(b, 10), add(b, 20)]); // 13, 23
+  // Demoted: mixed parallel batch (one object arg, one primitive).
+  const [e, f] = await Promise.all([unwrapValue({ value: c }), add(d, 1)]); // 13, 24
+  // Wait boundary: step races (and beats) a sleep.
+  const winner = await Promise.race([
+    delayMsStep(100, 'step'),
+    sleep('30s').then(() => 'sleep'),
+  ]); // 'step'
+  // Wait boundary: plain sleep.
+  await sleep('1s');
+  // Hook boundary: hook payload awaited in parallel with a primitive step.
+  using hook = createHook<{ delta: number }>({ token });
+  const [payload, g] = await Promise.all([hook, add(e + f, 100)]); // _, 137
+  // Retained again after all the demotions.
+  const h = await add(g, payload.delta); // 137 + delta
+  return { a, b, c, d, e, f, winner, g, h };
+}
+
+//////////////////////////////////////////////////////////
+
 async function nullByteStep() {
   'use step';
   return 'null byte \0';
@@ -1382,7 +1424,7 @@ export async function errorStepThrowNonErrorValue() {
     await throwNonErrorFromStep();
     return { caught: false } as any;
   } catch (err: any) {
-    // After max retries the step handler wraps the underlying thrown value
+    // After max retries the step executor wraps the underlying thrown value
     // as `cause` on a FatalError. The wrapping FatalError is what reaches
     // the workflow's catch; the original non-Error object is on `err.cause`.
     return {
@@ -1548,7 +1590,7 @@ export class ChainableService {
     'use workflow';
     // When calling static methods via ClassName.method(), `this` inside the step
     // will be the class constructor (ChainableService). The class constructor
-    // is serialized with its classId and passed to the step handler.
+    // is serialized with its classId and passed to the step executor.
     //
     // NOTE: We use `ChainableService.method()` here instead of `this.method()` because
     // the `this` argument is not currently passed through when invoking a workflow via
@@ -1811,7 +1853,7 @@ export class Counter {
   /**
    * Instance method step: returns the sum of the counter's value and the given amount.
    * The `this` context (the Counter instance) is serialized and passed
-   * to the step handler, then deserialized before the method is called.
+   * to the step executor, then deserialized before the method is called.
    */
   async add(amount: number): Promise<number> {
     'use step';
@@ -2636,7 +2678,7 @@ async function stepThatFetchesWithSignal(signal: AbortSignal) {
   'use step';
   // This will throw AbortError because the signal is already aborted.
   // The error should NOT be caught here — it propagates to the workflow
-  // as a FatalError (wrapped by the step handler).
+  // as a FatalError (wrapped by the step executor).
   const response = await globalThis.fetch('https://example.com', { signal });
   return response.status;
 }
