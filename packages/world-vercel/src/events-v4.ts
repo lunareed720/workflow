@@ -451,6 +451,24 @@ interface FrameResponseLike {
  * for LIST (a streamed, sentinel-terminated multi-frame response) doesn't
  * map onto a single WS message.
  *
+ * **Known gap — event writes lose their client-side instrumentation on this
+ * path.** The HTTP branch goes through `fetchV4` → `instrumentedFetch`, which
+ * is not merely a `fetch` wrapper: it opens the OTEL CLIENT span, injects
+ * trace context into the outgoing request, sets the cache-bust header, emits
+ * the `DEBUG` logs, and — the reason it exists at all — routes through the
+ * global `fetch` that Vercel's observability "outgoing requests" view
+ * instruments. See the note on `fetchV4`: bypassing it via `undici.request()`
+ * is exactly what once made v4 event traffic disappear from the log viewer.
+ *
+ * The WS branch bypasses all of it. With the flag on, per-event writes have no
+ * client span, propagate no trace context to workflow-server, and do not
+ * appear in the outgoing-requests view; the server's own request metrics
+ * (which #660 tags with `transport`) are the only remaining signal. That is
+ * acceptable for an opt-in POC behind a flag and unacceptable as a default —
+ * instrumenting the transport (a span per `request()`, trace context carried
+ * in the frame meta rather than HTTP headers) is a prerequisite for making
+ * `ws` the default, not a follow-up nicety.
+ *
  * Opt-in: defaults to HTTP unless `WORKFLOW_EVENTS_TRANSPORT=ws` is set.
  * Was previously defaulted ON for this branch so the existing e2e/benchmark
  * suite would exercise the WS path without any dedicated wiring — that's no
