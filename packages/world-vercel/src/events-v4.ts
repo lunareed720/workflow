@@ -21,6 +21,7 @@
  * bytes — this module stays at the wire-bytes layer.
  */
 
+import { getVercelOidcToken } from '@vercel/oidc';
 import { decode } from 'cbor-x';
 import { decodeFrames, encodeFrame, V4_FRAME_CONTENT_TYPE } from './frames.js';
 import { getEventsDispatcher } from './http-client.js';
@@ -563,6 +564,51 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * A buffer wider than any OIDC token's lifetime, so `isExpired()` reports
+ * true and `@vercel/oidc` takes its refresh path instead of handing back the
+ * cached entry. 24h comfortably exceeds the 60min TTL.
+ */
+const OIDC_FORCE_REFRESH_BUFFER_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Ask `@vercel/oidc` to mint a new token before the next `getHttpConfig()`
+ * reads one, in response to the server draining a connection with
+ * `reason: 'auth_expiry'`.
+ *
+ * Best-effort by design, and it is worth being precise about when it can
+ * actually do anything. `getVercelOidcToken()` resolves
+ * `getContext().headers['x-vercel-oidc-token'] ?? process.env.VERCEL_OIDC_TOKEN`
+ * — the request-context header wins. `refreshToken()` only writes
+ * `process.env.VERCEL_OIDC_TOKEN`. So:
+ *
+ *  - **Inside a deployed Vercel function**, the invocation's own header token
+ *    always shadows anything refreshed into the environment. There is
+ *    genuinely no fresher token to obtain mid-invocation, so this is a no-op
+ *    and the transport's stale-token guard is what handles it: it declines to
+ *    reconnect with a bearer the server has already rejected, and waits for
+ *    the next write, which will usually come from a new invocation carrying a
+ *    new token.
+ *  - **Outside one** (CLI, local dev, a long-lived server using
+ *    `VERCEL_OIDC_TOKEN`), there is no context header, the refresh writes a
+ *    genuinely new token to the environment, and the reconnect picks it up.
+ *
+ * Swallows its own failures: an unavailable refresh must not turn into a
+ * failed event write when `getHttpConfig()` can still produce a usable —
+ * if soon-to-expire — bearer.
+ */
+async function refreshOidcTokenBestEffort(): Promise<void> {
+  try {
+    await getVercelOidcToken({
+      expirationBufferMs: OIDC_FORCE_REFRESH_BUFFER_MS,
+    });
+  } catch {
+    // No refresh path available here. getHttpConfig() below still resolves
+    // whatever token it can, and the transport decides whether reconnecting
+    // with it is worth attempting.
+  }
+}
+
+/**
  * Resolve the WS transport for a run, or `null` when this World can't use
  * one and the caller should fall back to HTTP.
  */
@@ -609,7 +655,10 @@ function resolveWsTransport(
     );
   }
   const wsUrl = toEventsWsUrl(baseUrl, runId);
-  const transport = getWsEventsTransport(wsUrl, async () => {
+  const transport = getWsEventsTransport(wsUrl, async ({ forceRefresh }) => {
+    // `forceRefresh` means the previous socket was drained by the server
+    // because its *bearer* was expiring, not because the socket aged out.
+    if (forceRefresh) await refreshOidcTokenBestEffort();
     const { headers } = await getHttpConfig(config);
     return headersToRecord(headers);
   });
